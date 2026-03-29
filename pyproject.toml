@@ -1,0 +1,32 @@
+[build-system]
+requires     = ["briefcase>=0.4.0"]
+build-backend = "briefcase.backend"
+
+[tool.briefcase]
+project_name = "CalcSX_app"
+version      = "1.0.3"
+bundle       = "com.askrypek.calcsx"
+support_package = "calcsx-env.tar.gz"
+
+[tool.briefcase.app.CalcSX_app]
+formal_name   = "CalcSX"
+description   = "A magnetostatics simulation"
+author        = "Alexander Skrypek"
+author_email  = "as7168@columbia.edu"
+license       = "MIT"
+requires = [
+  "numpy",
+  "pandas",
+  "matplotlib",
+  "PyQt5",
+  "mplcursors"
+]
+
+# Only your inner package
+sources       = ["CalcSX_app"]
+
+# Non‑code assets
+resources     = ["CalcSX_app/resources"]
+icon          = "CalcSX_app/resources/images/app"
+
+entry_point = "CalcSX_app.main:main"
