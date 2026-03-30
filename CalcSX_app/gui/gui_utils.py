@@ -8,9 +8,15 @@ from PyQt5.QtWidgets import QProgressDialog, QApplication, QLabel
 from pathlib import Path
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 
-# load and cache the pixmap once
+# load and cache the pixmap once (deferred until QApplication exists)
 _LOGO_PATH = Path(__file__).parent.parent / "resources" / "images" / "powered_by.png"
-_WATERMARK_PM = QPixmap(str(_LOGO_PATH))
+_WATERMARK_PM = None
+
+def _get_watermark_pm():
+    global _WATERMARK_PM
+    if _WATERMARK_PM is None:
+        _WATERMARK_PM = QPixmap(str(_LOGO_PATH))
+    return _WATERMARK_PM
 
 class WatermarkedCanvas(FigureCanvasQTAgg):
     """
@@ -69,7 +75,7 @@ class WatermarkedCanvas(FigureCanvasQTAgg):
         h = self.height()
         # target watermark width in pixels
         target_w = int(w * self._zoom)
-        scaled = _WATERMARK_PM.scaledToWidth(
+        scaled = _get_watermark_pm().scaledToWidth(
             target_w, Qt.SmoothTransformation
         )
 
