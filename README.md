@@ -1,6 +1,6 @@
 # CalcSX™
 ### A Magnetostatics Simulation
-**Version:** 1.0.3 &nbsp;|&nbsp; **Author:** Alexander Skrypek &nbsp;|&nbsp; **License:** MIT
+**Version:** 1.1.0 &nbsp;|&nbsp; **Author:** Alexander Skrypek &nbsp;|&nbsp; **License:** MIT
 
 Developed with assistance from the Columbia Fusion Research Center (CFRC).
 
@@ -19,17 +19,31 @@ The coil geometry is analyzed using Principal Component Analysis (PCA) to automa
 
 ---
 
+## What's New in v1.1.0
+
+| Change | Detail |
+|---|---|
+| **Vectorized Biot-Savart** | Core field kernel fully NumPy-vectorized — no Python loops over segments. Typical speedup: 10–50× for force integration, 100×+ for cross-section sampling |
+| **Chunked cross-section** | Large grids computed in 500-point memory-safe batches; no RAM spikes at high resolution |
+| **Adaptive grid resolution** | Cross-section grid size is user-configurable (32–512 pts/axis); no longer fixed at 120 |
+| **Configurable on-axis samples** | On-axis B-field profile sample count configurable (50–1000 pts) |
+| **Save Results** | Export arc data (force density, hoop stress) and on-axis B-field to CSV directly from the results view |
+| **Stage-aware loading screen** | Progress dialog shows the active computation step alongside quippy messages |
+
+---
+
 ## Features
 
 | Feature | Description |
 |---|---|
 | Filament Visualization | 3D parametric plot of coil geometry with PCA axis and direction of parametrization |
-| B-Field Analysis | On-axis magnitude profile and optional on-plane heat map |
+| B-Field Analysis | On-axis magnitude profile (configurable sample count) and optional on-plane heat map |
 | Lorentz Force Density | Segment-wise J×B vector field with viridis colormap |
 | Hoop Stress | Arc-length-resolved membrane hoop stress (MPa) |
 | Integration Methods | Simpson's Rule (default) or Gaussian Quadrature (higher accuracy) |
 | Interactive Plots | Hover cursor on all 2D plots for precise numerical readout |
 | Planar Coil Support | Automatic planar detection with adapted force/stress algorithms (beta) |
+| Result Export | Save computed arrays to CSV for downstream analysis |
 
 ---
 
@@ -42,8 +56,8 @@ Python **3.9** or later is recommended.
 
 | Library | Purpose |
 |---|---|
-| `numpy` | Numerical arrays and linear algebra |
-| `pandas` | CSV loading and data handling |
+| `numpy` | Numerical arrays, vectorized Biot-Savart kernel |
+| `pandas` | CSV loading, data handling, result export |
 | `matplotlib` | All plotting (2D and 3D) |
 | `PyQt5` | GUI framework |
 | `mplcursors` | Interactive hover cursors on 2D plots |
@@ -103,9 +117,13 @@ python main.py
    - **Current (A)** — operating current
    - **Tape Thickness (µm)** — per-layer tape thickness (default: 80 µm, standard ReBCO)
    - **Tape Width (mm)** — tape width (default: 4.00 mm)
-4. *(Optional)* Check **Calculate B-Field Cross-section** to compute a heat map on the centroid plane. Set the **max |B|** filter threshold for display fidelity. Note: this is computationally expensive.
-5. *(Optional)* Check **Use Gaussian Quadrature** for higher-accuracy force integration. Note: not recommended for coils with more than ~300 points.
+   - **On-Axis Samples** — number of points on the B-field profile (default: 200)
+4. *(Optional)* Check **Calculate B-Field Cross-section** to compute a heat map on the centroid plane.
+   - Set the **max |B|** filter threshold for display fidelity.
+   - Set the **Cross-section Grid** resolution (32–512 pts/axis; higher = more detail, slower).
+5. *(Optional)* Check **Use Gaussian Quadrature** for higher-accuracy force integration (not recommended for coils with more than ~300 points).
 6. Click **Generate** to run the full analysis.
+7. On the results page, click **Save Results…** to export computed arrays to CSV.
 
 ---
 
@@ -114,8 +132,7 @@ python main.py
 After generation, CalcSX™ displays the following in a tabbed results view:
 
 - **Filament Curve** — 3D plot with PCA axis, in-plane basis vectors, and parametrization direction
-- **Lorentz Force Density Vectors** — 3D quiver plot colored by magnitude (N/m)
-- **Normalized Force Vectors** — Same as above with uniform arrow lengths; toggle via checkbox
+- **Lorentz Force Density Vectors** — 3D quiver plot colored by magnitude (N/m); toggle normalized arrows via checkbox
 - **Force Density vs Arc Length** — 2D line plot with interactive cursor
 - **Hoop Stress vs Arc Length** — 2D line plot with interactive cursor (MPa)
 - **|B| vs Axis Distance** — On-axis B-field profile with interactive cursor
