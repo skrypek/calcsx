@@ -149,43 +149,51 @@ class LogoMixin:
 
 class ProgressReporter(QObject):
     """
-    Enables dynamic loading screen
+    Dynamic loading screen with quippy cycling messages and a stage subtitle
+    that reflects the actual computation step in progress.
     """
-    
+
     DEFAULT_MESSAGES = [
-        "Crunching numbers...", "Smoothing splines...", "Aligning magnetic fields...", "Doing the math...",
-        "Winding HTS...", "Acting busy...", "Spinning gimbal...", "Charging capacitors...", "Calculating Lorentz forces...",
-        "Applying stress model...", "Dividing by zero...", "Working overtime...", "Finishing up...", "Thinking..."
+        "Crunching numbers", "Smoothing splines", "Aligning magnetic fields",
+        "Doing the math", "Winding HTS", "Acting busy", "Spinning the gimbal",
+        "Charging capacitors", "Calculating Lorentz forces", "Applying stress model",
+        "Dividing by zero", "Working overtime", "Thinking very hard",
+        "Vectorizing field equations", "Batching the Biot-Savart",
+        "Querying the matrix", "Racing electrons", "Consulting Maxwell",
+        "Solving in parallel", "Flipping the parity", "Inverting the Jacobian",
+        "Aligning flux quanta", "Cooling the coil", "Integrating by parts",
     ]
 
     def __init__(self, parent=None, title=""):
         super().__init__(parent)
-        self.dlg = QProgressDialog("Booting up...", None, 0, 100, parent)
+        self.dlg = QProgressDialog("Booting up", None, 0, 100, parent)
         self.dlg.setWindowTitle(title)
         self.dlg.setWindowModality(Qt.WindowModal)
         self.dlg.setAutoReset(False)
         self.dlg.setAutoClose(False)
         self.dlg.setCancelButton(None)
 
-        # center label text
+        # Enable rich text on the inner label so HTML renders correctly
         label = self.dlg.findChild(QLabel)
         if label:
             label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+            label.setTextFormat(Qt.RichText)
 
         # state
-        self._msgs = []
-        self._base_message = "Booting up..."
-        self._dot_cycle = ["", ".", "..", "..."]
-        self._dot_index = 0
+        self._msgs         = []
+        self._base_message = "Booting up"
+        self._stage_text   = ""          # current computation stage (subtitle)
+        self._dot_cycle    = ["", ".", "..", "..."]
+        self._dot_index    = 0
 
         # progress-driven switching
-        self._count = 0
+        self._count    = 0
         self._interval = 0
-        self._booting = True
+        self._booting  = True
 
         # timing to prevent too-frequent message switches
-        self._last_msg_time = 0.0
-        self._min_msg_seconds = 5.0  # minimum seconds between message switches
+        self._last_msg_time  = 0.0
+        self._min_msg_seconds = 4.0
 
         # timers
         self._dot_timer = QTimer(self)
@@ -196,26 +204,27 @@ class ProgressReporter(QObject):
         self._boot_timer.timeout.connect(self._end_boot)
 
     def start(self):
-        self._msgs = [m for m in self.DEFAULT_MESSAGES if m != "Booting up..."]
-        self._base_message = "Booting up..."
-        self._dot_index = 0
-        self._booting = True
+        self._msgs         = list(self.DEFAULT_MESSAGES)
+        random.shuffle(self._msgs)
+        self._base_message = "Booting up"
+        self._stage_text   = ""
+        self._dot_index    = 0
+        self._booting      = True
 
         self.dlg.setValue(0)
         self._update_label()
         self.dlg.show()
         QApplication.processEvents()
 
-        self._dot_timer.start(1000)  # dot animation (1s)
-        self._boot_timer.start(2000)  # "Booting up" lasts 2.0s
+        self._dot_timer.start(700)       # dot animation every 700 ms
+        self._boot_timer.start(1800)     # boot phase lasts 1.8 s
 
-        self._interval = random.randint(16, 22)
-        self._count = 0
-        self._last_msg_time = time.time()
+        self._interval       = random.randint(12, 20)
+        self._count          = 0
+        self._last_msg_time  = time.time()
 
     def report(self, pct: int):
-        """Call this with current percent (0–100)."""
-        
+        """Update progress bar; may cycle to the next quippy message."""
         self.dlg.setValue(pct)
 
         if not self._booting:
@@ -224,22 +233,29 @@ class ProgressReporter(QObject):
             if (self._count >= self._interval and
                     (now - self._last_msg_time) >= self._min_msg_seconds):
                 self._next_message()
-                self._count = 0
-                self._interval = random.randint(16, 22)
+                self._count    = 0
+                self._interval = random.randint(12, 20)
                 self._last_msg_time = now
 
         QApplication.processEvents()
+
+    def set_stage(self, msg: str):
+        """Show the current computation stage as a subtitle (called from worker thread via signal)."""
+        self._stage_text = msg
+        self._update_label()
 
     def finish(self):
         self._dot_timer.stop()
         self._boot_timer.stop()
         self.dlg.setValue(100)
         self._base_message = "Done"
-        self._dot_index = 0
+        self._stage_text   = ""
+        self._dot_index    = 0
         self._update_label()
-        QTimer.singleShot(800, self.dlg.close)
+        QTimer.singleShot(600, self.dlg.close)
 
     # ---- internal helpers ----
+
     def _end_boot(self):
         self._booting = False
         self._next_message()
@@ -247,18 +263,32 @@ class ProgressReporter(QObject):
 
     def _next_message(self):
         if self._msgs:
-            self._base_message = self._msgs.pop(random.randrange(len(self._msgs)))
+            self._base_message = self._msgs.pop()
         else:
-            self._base_message = "Checking work..."
-        # DO NOT reset self._dot_index here — lets dots continue cycling
+            # Replenish and reshuffle when exhausted
+            self._msgs = list(self.DEFAULT_MESSAGES)
+            random.shuffle(self._msgs)
+            self._base_message = self._msgs.pop()
         self._update_label()
 
     def _update_label(self):
         dots = self._dot_cycle[self._dot_index]
-        base = self._base_message.rstrip('.')  # remove baked-in dots (self-check)
-        text = base + dots if dots else base
-        text += ' ' * (3 - len(dots))  # reserve space for max three dots
-        self.dlg.setLabelText(text)
+        base = self._base_message.rstrip('.')
+        # Reserve horizontal space for up to 3 dots using non-breaking spaces
+        padding = '&nbsp;' * (3 - len(dots))
+        quippy  = f"{base}{dots}{padding}"
+
+        if self._stage_text:
+            html = (
+                f'<div style="text-align:center; line-height:1.5">'
+                f'{quippy}<br>'
+                f'<span style="font-size:85%; color:#888">{self._stage_text}</span>'
+                f'</div>'
+            )
+        else:
+            html = f'<div style="text-align:center">{quippy}</div>'
+
+        self.dlg.setLabelText(html)
 
     def _advance_dots(self):
         self._dot_index = (self._dot_index + 1) % len(self._dot_cycle)

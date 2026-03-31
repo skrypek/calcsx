@@ -42,17 +42,21 @@ plt.ioff()
 
 class AnalysisWorker(QObject):
     progress = pyqtSignal(int)
+    stage    = pyqtSignal(str)
     finished = pyqtSignal(object)
 
-    def __init__(self, coords, winds, current, thickness, width, compute_bfield, use_gauss):
+    def __init__(self, coords, winds, current, thickness, width,
+                 compute_bfield, use_gauss, n_grid=120, axis_num=200):
         super().__init__()
-        self.coords = coords
-        self.winds = winds
-        self.current = current
+        self.coords    = coords
+        self.winds     = winds
+        self.current   = current
         self.thickness = thickness
-        self.width = width
+        self.width     = width
         self.compute_b = compute_bfield
         self.use_gauss = use_gauss
+        self.n_grid    = int(n_grid)
+        self.axis_num  = int(axis_num)
 
     @pyqtSlot()
     def run(self):
@@ -66,7 +70,10 @@ class AnalysisWorker(QObject):
         engine.run_analysis(
             compute_bfield=self.compute_b,
             use_gauss=self.use_gauss,
-            progress_callback=self.progress.emit
+            n_grid=self.n_grid,
+            axis_num=self.axis_num,
+            progress_callback=self.progress.emit,
+            stage_callback=self.stage.emit
         )
         self.finished.emit(engine)
 
@@ -86,34 +93,59 @@ class LandingPage(LogoMixin, QWidget):
         form.addRow("Tape Thickness (µm):", self.dspin_thick)
         form.addRow("Tape Width (mm):",     self.dspin_width)
 
+        # On-axis sample count (always visible)
+        self.spin_axis_pts = QSpinBox()
+        self.spin_axis_pts.setRange(50, 1000)
+        self.spin_axis_pts.setSingleStep(50)
+        self.spin_axis_pts.setValue(200)
+        form.addRow("On-Axis Samples:", self.spin_axis_pts)
+
         self.chk_bdist = QCheckBox("Calculate B‑field Cross-section")
         form.addRow("", self.chk_bdist)
-        
+
         # --- Threshold (spin box only) ---
         self.spin_thresh = QDoubleSpinBox()
-        self.spin_thresh.setRange(0.01, 20.00)   # 0.01 T .. 20.00 T
+        self.spin_thresh.setRange(0.01, 20.00)
         self.spin_thresh.setSingleStep(0.01)
         self.spin_thresh.setDecimals(2)
         self.spin_thresh.setValue(5.00)
         self.spin_thresh.setEnabled(False)
-        
+
         self.lbl_thresh = QLabel("Cross‑section max |B|:")
         self.lbl_thresh.setEnabled(False)
-        
-        # Enable/disable when checkbox toggles
+
+        # --- Grid resolution (only enabled with cross-section) ---
+        self.spin_grid_res = QSpinBox()
+        self.spin_grid_res.setRange(32, 512)
+        self.spin_grid_res.setSingleStep(8)
+        self.spin_grid_res.setValue(120)
+        self.spin_grid_res.setEnabled(False)
+
+        self.lbl_grid_res = QLabel("Cross‑section Grid (pts/axis):")
+        self.lbl_grid_res.setEnabled(False)
+
+        # Enable/disable cross-section controls when checkbox toggles
         def _toggle_thresh(state):
             enabled = (state == Qt.Checked)
             self.spin_thresh.setEnabled(enabled)
             self.lbl_thresh.setEnabled(enabled)
-        
+            self.spin_grid_res.setEnabled(enabled)
+            self.lbl_grid_res.setEnabled(enabled)
+
         self.chk_bdist.stateChanged.connect(_toggle_thresh)
-        
-        # Put label + spin box on one row
-        h = QHBoxLayout()
-        h.addWidget(self.lbl_thresh)
-        h.addWidget(self.spin_thresh)
-        form.addRow("", h)
-        
+
+        # Threshold row
+        h_thresh = QHBoxLayout()
+        h_thresh.addWidget(self.lbl_thresh)
+        h_thresh.addWidget(self.spin_thresh)
+        form.addRow("", h_thresh)
+
+        # Grid resolution row
+        h_grid = QHBoxLayout()
+        h_grid.addWidget(self.lbl_grid_res)
+        h_grid.addWidget(self.spin_grid_res)
+        form.addRow("", h_grid)
+
         self.chk_gauss = QCheckBox("Use Gaussian Quadrature")
         form.addRow("", self.chk_gauss)
 
@@ -223,10 +255,14 @@ class LandingPage(LogoMixin, QWidget):
         self.btn_load.setText("Load CSV...")
         self.btn_preview.setEnabled(False)
         self.btn_next.setEnabled(False)
+        self.spin_axis_pts.setValue(200)
         self.chk_bdist.setChecked(False)
         self.spin_thresh.setValue(5.00)
         self.spin_thresh.setEnabled(False)
         self.lbl_thresh.setEnabled(False)
+        self.spin_grid_res.setValue(120)
+        self.spin_grid_res.setEnabled(False)
+        self.lbl_grid_res.setEnabled(False)
         self.chk_gauss.setChecked(False)
         # drop stored data
         if hasattr(self, 'coords'):
@@ -236,6 +272,12 @@ class LandingPage(LogoMixin, QWidget):
             
     def get_cross_section_threshold(self) -> float:
         return self.spin_thresh.value()
+
+    def get_grid_resolution(self) -> int:
+        return self.spin_grid_res.value()
+
+    def get_axis_samples(self) -> int:
+        return self.spin_axis_pts.value()
 
 
 class HelpDialog(QDialog):
@@ -345,21 +387,27 @@ class MainWindow(QMainWindow):
         self.reporter.start()
 
         # gather parameters
-        coords   = self.landing.coords
-        winds    = self.landing.spin_winds.value()
-        current  = self.landing.dspin_current.value()
-        thick    = self.landing.dspin_thick.value()
-        width    = self.landing.dspin_width.value()
-        want_b   = self.landing.chk_bdist.isChecked()
-        want_gq  = self.landing.chk_gauss.isChecked()
+        coords    = self.landing.coords
+        winds     = self.landing.spin_winds.value()
+        current   = self.landing.dspin_current.value()
+        thick     = self.landing.dspin_thick.value()
+        width     = self.landing.dspin_width.value()
+        want_b    = self.landing.chk_bdist.isChecked()
+        want_gq   = self.landing.chk_gauss.isChecked()
+        n_grid    = self.landing.get_grid_resolution()
+        axis_num  = self.landing.get_axis_samples()
 
         # set up worker thread
         self.thread = QThread(self)
-        self.worker = AnalysisWorker(coords, winds, current, thick, width, want_b, want_gq)
+        self.worker = AnalysisWorker(
+            coords, winds, current, thick, width,
+            want_b, want_gq, n_grid, axis_num
+        )
         self.worker.moveToThread(self.thread)
 
         # connect signals
         self.worker.progress.connect(self.reporter.report)
+        self.worker.stage.connect(self.reporter.set_stage)
         self.worker.finished.connect(lambda eng: self.on_analysis_done(eng, want_b))
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)

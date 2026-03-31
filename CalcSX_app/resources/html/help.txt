@@ -30,12 +30,22 @@
 
   <h3>What's New!</h3>
   <ul>
-    <li><b>v1.0.3</b> brings improved functionality and bug fixes</li>
-    <li>B-field cross section plotting</li>
-    <li>Planar coil capability (available, but in beta)</li>
-    <li>Force density calculations—instead of simple force</li>
-    <li>Loading screen optimization (still in the works)</li>
-    <li>Added CalcSX™ watermark on plots</li>
+    <li><b>v1.1.0</b> — Performance &amp; usability overhaul</li>
+    <ul>
+      <li><b>Vectorized Biot-Savart engine</b>: all field evaluations now use fully NumPy-vectorized kernels — no Python loops over segments. Typical speedup: 10–50× for force integration, 100×+ for B-field cross-section</li>
+      <li><b>Chunked cross-section sampling</b>: large grids computed in memory-safe batches; no RAM spikes for high-resolution runs</li>
+      <li><b>Adaptive cross-section resolution</b>: new <i>Cross-section Grid</i> control (32–512 pts/axis) replaces the fixed 120×120 grid</li>
+      <li><b>Configurable on-axis samples</b>: new <i>On-Axis Samples</i> control (50–1000 pts) for the B-field profile</li>
+      <li><b>Save Results</b>: export arc-position, force density, hoop stress, and on-axis B-field to CSV from the results view</li>
+      <li><b>Stage-aware loading screen</b>: progress dialog now shows the active computation step as a subtitle alongside the quippy messages</li>
+    </ul>
+    <li><b>v1.0.3</b> — functionality and bug fixes</li>
+    <ul>
+      <li>B-field cross section plotting</li>
+      <li>Planar coil capability (beta)</li>
+      <li>Force density calculations</li>
+      <li>CalcSX™ watermark on plots</li>
+    </ul>
   </ul>
 
   <h3>Getting Started</h3>
