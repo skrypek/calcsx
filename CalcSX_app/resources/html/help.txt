@@ -17,7 +17,7 @@
   b { font-weight: 600; }
   table { border-collapse: collapse; width: 100%; margin: .6em 0 1em; font-size: 11pt; }
   th { text-align: left; padding: 4px 10px; border-bottom: 2px solid #ccc; font-weight: 600; }
-  td { padding: 3px 10px; border-bottom: 1px solid #e0e0e0; }
+  td { padding: 3px 10px; border-bottom: 1px solid #e0e0e0; vertical-align: top; }
 </style>
 </head>
 <body>
@@ -27,62 +27,59 @@
     <b>Version:</b> v$VERSION<br>
     <b>Author:</b> Alexander Skrypek<br>
     <b>Website:</b> <a href="https://calc.sx">calc.sx</a><br>
-    <b>Copyright:</b> © 2025 Alexander Skrypek.<br>
+    <b>Copyright:</b> © 2026 Alexander Skrypek.<br>
     <b>Trademark:</b> CalcSX™ (trademark pending).
   </p>
   <hr>
 
-  <h3>What's New in v2.0.0</h3>
+  <h3>Version 2.0.0 has arrived!</h3>
 
   <b>INSPECT Tools — Field Visualization Overhaul</b>
-  <ul>
-    <li><b>Magnetic field line tracing</b> — 3-D streamlines seeded on a Fibonacci sphere around the coil, integrated forward and backward via batched RK4; coloured by log₁₀|B| (cool colormap)</li>
-    <li><b>Slidable cross-section plane</b> — 2-D B-field heatmap sliced perpendicular to the PCA symmetry axis; position adjustable via "Section Pos. (m)" in the Properties panel</li>
-    <li><b>log₁₀ colormap scaling</b> — dynamic range compression so near-coil strong-field and far-field weak-field are simultaneously readable</li>
-    <li><b>Independent scalar bars</b> — each INSPECT layer carries its own legend; visibility follows the eye-icon toggle in the browser</li>
-    <li><b>Non-interfering layers</b> — Field Lines and Cross Section coexist; running one does not clear the other</li>
-  </ul>
+  <table>
+    <tr><th>Change</th><th>Detail</th></tr>
+    <tr><td><b>Magnetic field line tracing</b></td><td>3-D streamlines seeded on a Fibonacci sphere around the coil, integrated forward and backward via batched RK4</td></tr>
+    <tr><td><b>Slidable cross-section plane</b></td><td>2-D B-field heatmap sliced perpendicular to the PCA symmetry axis; position adjustable via "Section Pos. (m)" spinbox in the Properties panel</td></tr>
+    <tr><td><b>log₁₀ colormap scaling</b></td><td>Dynamic range compression for both INSPECT layers — near-coil strong-field and far-field weak-field are simultaneously readable</td></tr>
+    <tr><td><b>Independent scalar bars</b></td><td>Each INSPECT layer carries its own legend; visibility follows the browser eye-icon toggle</td></tr>
+    <tr><td><b>Non-interfering layers</b></td><td>Field Lines and Cross Section coexist — running one does not clear the other</td></tr>
+  </table>
 
   <b>Workspace and UI</b>
-  <ul>
-    <li><b>Terrain camera mode</b> — camera up-axis locked to Z (Fusion 360-style); the coil appears to rotate above a fixed ground plane</li>
-    <li><b>Improved floor grid</b> — higher contrast reference grid sized to 10× the coil diameter</li>
-    <li><b>Zoom lock on normalize toggle</b> — toggling "Normalize Force Vectors" no longer resets the viewport camera</li>
-  </ul>
+  <table>
+    <tr><th>Change</th><th>Detail</th></tr>
+    <tr><td><b>Removed B-Field Volume</b></td><td>Legacy feature was never pushed and ultimately scrapped in favor of more practical visualization tools</td></tr>
+  </table>
+
+  <b>Physics Core</b>
+  <table>
+    <tr><th>Change</th><th>Detail</th></tr>
+    <tr><td><b>Batched RK4 field-line integrator</b></td><td>All active seed lines advanced simultaneously in NumPy — no Python loop over individual lines</td></tr>
+    <tr><td><b>Chunked midplane evaluation</b></td><td>Cross-section B-field computed in 2 000-point chunks for memory efficiency</td></tr>
+    <tr><td><b>Fibonacci sphere seeding</b></td><td>Uniform seed distribution on the unit sphere; configurable seed count (8–60) in the Properties panel</td></tr>
+  </table>
 
   <h3>Version History</h3>
   <table>
     <tr><th>Version</th><th>Highlights</th></tr>
-    <tr><td><b>2.0.0</b></td><td>INSPECT tools (field lines + slidable cross-section); terrain camera; scalar bar overhaul</td></tr>
-    <tr><td>1.3.0</td><td>Full PyVista/VTK 3-D backend; Fusion 360 workbench (ribbon, layer browser, properties panel); normalize-forces toggle</td></tr>
-    <tr><td>1.2.0</td><td>Two-panel workbench; dark theme throughout; B-field slice viewer; CAD-style 3-D rendering</td></tr>
+    <tr><td><b>2.0.0</b></td><td>INSPECT tools introduced; UI adjustments</td></tr>
+    <tr><td>1.3.0</td><td>Full PyVista/VTK 3-D backend; Fusion 360 workbench (ribbon, layer browser, properties panel); B-field volume; normalize-forces toggle</td></tr>
+    <tr><td>1.2.0</td><td>Major UI overhaul: two-panel workbench, dark theme throughout; B-field slice viewer</td></tr>
     <tr><td>1.1.0</td><td>Vectorized Biot-Savart kernel (10–50× speedup); chunked cross-section; Save Results</td></tr>
     <tr><td>1.0.0</td><td>Initial release: CSV loading, Biot-Savart, PyQt5 GUI, force/stress/axis plots</td></tr>
   </table>
-
   <hr>
 
   <h3>Getting Started</h3>
   <ol>
-    <li><b>Prepare your CSV</b> — columns must be labeled <b>x</b>, <b>y</b>, <b>z</b> (case-sensitive). If no headers are present, the first three columns are used. The curve does not need to be manually closed; CalcSX™ closes open loops automatically.</li>
+    <li><b>Prepare your CSV</b> — columns must be labeled <b>x</b>, <b>y</b>, <b>z</b> (case-sensitive). If no headers are present, the first three columns are used. The curve does not need to be manually closed — CalcSX™ closes open loops automatically.</li>
     <li><b>Run the application</b> — <code>python -m CalcSX_app.main</code> from the repo root.</li>
-    <li>Click <b>▲ Load CSV</b> in the ribbon FILE group — the coil wire appears in the 3-D viewport and "Coil" is added to the browser under <b>Coils</b>.</li>
-    <li>Set coil parameters in the <b>Properties panel</b>:
-      <ul>
-        <li><b>Winds</b> — total winding count</li>
-        <li><b>Current (A)</b> — operating current</li>
-        <li><b>Tape Thick (µm)</b> — per-layer tape thickness (default: 80 µm, standard ReBCO)</li>
-        <li><b>Tape Width (mm)</b> — tape width (default: 4.00 mm)</li>
-        <li><b>Axis Samples</b> — number of on-axis B-field profile points</li>
-        <li><b>Gaussian Quadrature</b> — higher-accuracy force integration (avoid for &gt; ~300 pts)</li>
-        <li><b>Normalize Force Vectors</b> — toggle between magnitude-encoded and uniform-length arrows</li>
-      </ul>
-    </li>
+    <li>Click <b>▲ Load CSV</b> in the ribbon FILE group — the coil wire appears in the viewport and "Coil" is added to the browser under <b>Coils</b>.</li>
+    <li>Set coil parameters in the <b>Properties panel</b> (winds, current, tape dimensions, etc.).</li>
     <li>Click <b>▶ Run Analysis</b> — Forces, Stress, and B Axis layers appear; results summary populates.</li>
     <li>Switch to the <b>INSPECT</b> tab in the ribbon:
       <ul>
-        <li><b>∿ Field Lines</b> — traces 3-D magnetic field lines. Set seed count in the Properties panel (8–60).</li>
-        <li><b>⊡ Cross Section</b> — renders a 2-D B-field heatmap on a plane through the coil. Use <b>Section Pos. (m)</b> to slide the plane along the symmetry axis.</li>
+        <li><b>∿ Field Lines</b> — traces 3-D magnetic field lines. Set seed count in the Properties panel.</li>
+        <li><b>⊡ Cross Section</b> — renders a 2-D B-field heatmap. Use <b>Section Pos. (m)</b> to slide the plane along the symmetry axis.</li>
       </ul>
     </li>
     <li>Toggle any layer using the eye icons (●/○) in the browser panel; legends hide and show with their layer.</li>
@@ -105,28 +102,48 @@
     <tr><td><b>Lorentz Force Layer</b></td><td>Per-segment J×B arrow glyphs, plasma-coloured by magnitude; normalizable</td></tr>
     <tr><td><b>Hoop Stress Layer</b></td><td>Midpoint point cloud coloured by hoop stress (MPa, YlOrRd)</td></tr>
     <tr><td><b>On-Axis B-Field Layer</b></td><td>Point cloud along the PCA axis coloured by |B| (cool cmap)</td></tr>
-    <tr><td><b>Field Lines (INSPECT)</b></td><td>3-D magnetic streamlines, batched RK4, log₁₀|B| coloured</td></tr>
+    <tr><td><b>Field Lines (INSPECT)</b></td><td>3-D magnetic streamlines, batched RK4, log₁₀|B| coloured (cool)</td></tr>
     <tr><td><b>Cross Section (INSPECT)</b></td><td>2-D B-field heatmap in any plane along the axis; slidable offset</td></tr>
-    <tr><td><b>Layer Browser</b></td><td>Eye-icon toggles per layer and per group; legends follow visibility</td></tr>
-    <tr><td><b>Vectorized Biot-Savart</b></td><td>Fully NumPy-vectorized kernel; optional Gaussian Quadrature</td></tr>
+    <tr><td><b>Layer Browser</b></td><td>Eye-icon toggles per layer and per group; legend visibility follows</td></tr>
+    <tr><td><b>Ribbon Toolbar</b></td><td>SIMULATION / INSPECT / CONSTRUCT / UTILITIES tabs</td></tr>
+    <tr><td><b>Integration Methods</b></td><td>Vectorized Biot-Savart; optional Gaussian Quadrature</td></tr>
+    <tr><td><b>Dark Theme</b></td><td>VS-Code-inspired palette throughout UI</td></tr>
   </table>
 
   <h3>Future Directions</h3>
+
+  <b>High Priority</b>
   <ul>
-    <li><b>GPU acceleration</b> — Biot-Savart kernel offloaded to CUDA/Metal for interactive-speed large coils</li>
-    <li><b>Real conductor cross-sections</b> — finite cross-section winding pack (ReBCO tape stacks, cable bundles) with B and force distributions within the pack</li>
-    <li><b>Quench simulation</b> — thermal runaway propagation, hot-spot temperature, energy dump, and animated quench-front visualization</li>
-    <li><b>Multi-coil superposition</b> — load multiple CSVs with summed B-fields; independent browser groups per coil</li>
-    <li><b>In-app coil prototyping</b> — parametric geometry builder (solenoid, saddle, helical, pancake) with real-time 3-D preview</li>
-    <li><b>Field line topology</b> — Poincaré sections, separatrix detection, connection-length plots</li>
-    <li><b>VTK / ParaView export</b> — save field volumes and surface meshes for downstream post-processing</li>
-    <li><b>2-D detail panels</b> — floating arc-length plots (force, stress, on-axis B-field) per layer</li>
+    <li><b>GPU acceleration</b> — offload the Biot-Savart kernel to CUDA/Metal via CuPy or PyTorch so that large coil geometries (&gt;10 000 segments) and fine field-line integration become interactive-speed</li>
+    <li><b>Real conductor cross-sections</b> — replace the filamentary wire model with a finite cross-section discretization (e.g., a stack of ReBCO tapes or a cable bundle); compute B and force distributions within the winding pack</li>
+  </ul>
+
+  <b>Physics Extensions</b>
+  <ul>
+    <li><b>Quench simulation</b> — thermal runaway model propagating through the winding pack; track normal-zone growth, hot-spot temperature, and energy dump into a protection circuit; visualize the propagating quench front in the 3-D viewport</li>
+    <li><b>Field line topology tools</b> — Poincaré section maps, separatrix detection, and field-line connection-length plots for confinement analysis</li>
+    <li><b>Multi-coil superposition</b> — load multiple CSVs and sum their B-fields; layer browser groups each coil independently; useful for solenoid pairs, Helmholtz coils, and tokamak PF-coil sets</li>
+  </ul>
+
+  <b>Design and CAD</b>
+  <ul>
+    <li><b>In-app coil prototyping</b> — parametric coil geometry builder (solenoid, saddle, helical, pancake) with real-time preview; export to CSV or STEP for manufacturing</li>
+    <li><b>Click-to-inspect</b> — click any point on the coil wire to query local B, J×B, and stress; scroll the sidebar to the corresponding layer</li>
+    <li><b>Undo / redo</b> — full action stack so CSV reloads and analysis re-runs can be stepped back</li>
+  </ul>
+
+  <b>Output and Integration</b>
+  <ul>
+    <li><b>VTK / ParaView export</b> — save computed field volumes and surface meshes for downstream post-processing</li>
+    <li><b>2-D detail panels</b> — floating windows per layer with arc-length plots (force vs arc, stress vs arc, on-axis B-field profile)</li>
+    <li><b>Persistent settings</b> — save last-used coil parameters, seed count, and section offset to a JSON config file</li>
+    <li><b>Briefcase packaging</b> — signed, distributable macOS and Windows app bundles</li>
   </ul>
 
   <hr>
   <p>Support: <a href="mailto:as7168@columbia.edu">as7168@columbia.edu</a> &nbsp;|&nbsp; <a href="https://calc.sx">calc.sx</a></p>
   <p class="small">
-    Developed with assistance from the Columbia Fusion Research Center (CFRC).
+    Developed with experimental validation assistance from the Columbia Fusion Research Center (CFRC).
     All rights reserved by the author. CalcSX™ is a pending trademark of Alexander Skrypek.
   </p>
 </div>
