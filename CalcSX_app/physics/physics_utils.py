@@ -668,3 +668,241 @@ class CoilAnalysis:
 
         Bmag[mask] = mags
         return X, Y, Bmag, (-R, R, -R, R)
+
+    def compute_bfield_planes(self, n_planes: int = 20, grid_size: int = 50,
+                               margin: float = 1.2,
+                               progress_callback=None):
+        """
+        Compute |B| on *n_planes* cross-sections evenly spaced along the PCA axis.
+
+        Each plane is perpendicular to the axis and uses the same orthonormal basis
+        as sample_cross_section, so the geometry is consistent.
+
+        Returns
+        -------
+        positions : (n_planes,)  axis offsets from mean_point (metres)
+        X, Y      : (grid_size, grid_size)  in-plane grid coordinates (metres)
+        planes    : (n_planes, grid_size, grid_size)  |B| values (T), NaN outside circle
+        R         : float  — circle radius (metres)
+        e1, e2    : (3,)   — orthonormal in-plane basis vectors
+        """
+        a = self.axis / np.linalg.norm(self.axis)
+
+        # Orthonormal in-plane basis (consistent with sample_cross_section)
+        helper = np.array([0, 0, 1.0]) if abs(a[2]) < 0.9 else np.array([0, 1.0, 0])
+        e1 = np.cross(a, helper); e1 /= np.linalg.norm(e1); e1 = -e1
+        e2 = np.cross(a, e1)
+
+        # Radial envelope from coil midpoints
+        rads        = self.midpoints - self.mean_point
+        axial_comp  = (rads @ a)[:, None] * a
+        R           = np.linalg.norm(rads - axial_comp, axis=1).max() * margin
+
+        lin = np.linspace(-R, R, grid_size)
+        X, Y = np.meshgrid(lin, lin, indexing='xy')  # (gs, gs)
+        circ = X ** 2 + Y ** 2 <= R ** 2              # boolean mask
+
+        L         = self.total_length
+        positions = np.linspace(-0.5 * L, 0.5 * L, n_planes)
+        planes    = np.full((n_planes, grid_size, grid_size), np.nan, dtype=np.float64)
+
+        chunk = 500
+        for k, z_pos in enumerate(positions):
+            center = self.mean_point + z_pos * a
+
+            # 3-D world coordinates of every grid point on this plane
+            P = (center
+                 + X[..., None] * e1[None, None, :]
+                 + Y[..., None] * e2[None, None, :])   # (gs, gs, 3)
+
+            pts  = P[circ]                              # (M, 3)
+            if len(pts) == 0:
+                continue
+
+            mags = np.empty(len(pts), dtype=np.float64)
+            for start in range(0, len(pts), chunk):
+                end = min(start + chunk, len(pts))
+                B   = self._bfield_vec(pts[start:end])  # (c, 3) — vectorized
+                mags[start:end] = np.linalg.norm(B, axis=1)
+
+            planes[k][circ] = mags
+
+            if progress_callback:
+                progress_callback(int(100 * (k + 1) / n_planes))
+
+        return positions, X, Y, planes, R, e1, e2
+
+    def compute_bfield_volume(self, n_vox: int = 32, margin: float = 1.4,
+                               progress_callback=None):
+        """
+        Compute |B| on a uniform 3-D Cartesian voxel grid enclosing the coil.
+
+        Parameters
+        ----------
+        n_vox   : grid points per axis (n_vox³ total evaluation points)
+        margin  : grid half-extent = coil_radius × margin
+
+        Returns
+        -------
+        xs, ys, zs  : 1-D coordinate arrays (voxel centres, metres)
+        B_vol       : ndarray (n_vox, n_vox, n_vox), |B| in Tesla
+        """
+        # Radial envelope from segment midpoints
+        R = float(np.max(np.linalg.norm(
+            self.midpoints - self.mean_point, axis=1
+        ))) * margin
+        if R == 0:
+            R = 0.1
+
+        c = self.mean_point
+        xs = np.linspace(c[0] - R, c[0] + R, n_vox)
+        ys = np.linspace(c[1] - R, c[1] + R, n_vox)
+        zs = np.linspace(c[2] - R, c[2] + R, n_vox)
+
+        XX, YY, ZZ = np.meshgrid(xs, ys, zs, indexing='ij')   # (nx, ny, nz)
+        pts = np.column_stack([XX.ravel(), YY.ravel(), ZZ.ravel()])  # (N, 3)
+
+        N      = len(pts)
+        B_flat = np.empty(N, dtype=np.float64)
+        # Larger chunks reduce Python loop overhead; each (chunk × n_seg × 3)
+        # working array stays well under ~150 MB for typical coil sizes.
+        chunk  = 2000
+        n_ch   = max(1, (N + chunk - 1) // chunk)
+
+        for ci in range(n_ch):
+            sl = slice(ci * chunk, min((ci + 1) * chunk, N))
+            B_flat[sl] = np.linalg.norm(self._bfield_vec(pts[sl]), axis=1)
+            if progress_callback:
+                progress_callback(int(100 * (ci + 1) / n_ch))
+
+        return xs, ys, zs, B_flat.reshape(n_vox, n_vox, n_vox)
+
+    def compute_field_lines(self, n_seeds=20, n_steps=600, max_radius_factor=3.5,
+                             progress_callback=None):
+        """
+        Compute 3D magnetic field line traces using batched RK4 integration.
+
+        Seeds n_seeds points on a Fibonacci sphere of radius ~0.6×coil_radius
+        around the coil centroid, then integrates both forward (sign=+1) and
+        backward (sign=-1) along the normalised B-field direction.
+
+        Returns
+        -------
+        lines  : list of (N, 3) float32 arrays — each is one field line path
+        B_mags : list of (N,) float32 arrays  — |B| (Tesla) at each point
+        """
+        R = float(np.max(np.linalg.norm(self.midpoints - self.mean_point, axis=1)))
+        if R == 0:
+            R = 0.1
+
+        step  = R * 0.07          # integration step length (metres)
+        max_r = R * max_radius_factor
+
+        # Fibonacci-lattice seeds on a sphere of radius 0.6×R
+        golden = (1.0 + 5.0 ** 0.5) / 2.0
+        seeds  = np.zeros((n_seeds, 3), dtype=np.float64)
+        for k in range(n_seeds):
+            theta     = np.arccos(max(-1.0, min(1.0, 1.0 - 2.0 * (k + 0.5) / n_seeds)))
+            phi       = 2.0 * np.pi * k / golden
+            seeds[k]  = self.mean_point + (R * 0.60) * np.array([
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta),
+            ])
+
+        all_lines: list = []
+        all_B:     list = []
+
+        for d_idx, sign in enumerate((1.0, -1.0)):
+            pts    = seeds.copy()
+            active = np.ones(n_seeds, dtype=bool)
+            trajs  = [[seeds[i].copy()] for i in range(n_seeds)]
+
+            for s in range(n_steps):
+                if not active.any():
+                    break
+                ai  = np.where(active)[0]
+                ap  = pts[ai]           # (n_active, 3)
+
+                # RK4 — four batched _bfield_vec calls per step
+                def unit_B(p):
+                    B   = self._bfield_vec(p)
+                    mag = np.linalg.norm(B, axis=-1, keepdims=True).clip(1e-30)
+                    return B / mag
+
+                u1     = unit_B(ap)
+                u2     = unit_B(ap + 0.5 * step * u1 * sign)
+                u3     = unit_B(ap + 0.5 * step * u2 * sign)
+                u4     = unit_B(ap +       step * u3 * sign)
+                new_ap = ap + sign * (step / 6.0) * (u1 + 2*u2 + 2*u3 + u4)
+                pts[ai] = new_ap
+
+                dist = np.linalg.norm(new_ap - self.mean_point, axis=1)
+                active[ai[dist >= max_r]] = False
+                for j, i in enumerate(ai):
+                    if active[i]:
+                        trajs[i].append(new_ap[j].copy())
+
+                if progress_callback and s % 30 == 0:
+                    pct = int(100 * (d_idx + s / n_steps) / 2)
+                    progress_callback(min(pct, 99))
+
+            for i in range(n_seeds):
+                if len(trajs[i]) < 3:
+                    continue
+                pts_arr  = np.array(trajs[i], dtype=np.float32)
+                B_chunks = []
+                chunk    = 300
+                for ci in range(0, len(pts_arr), chunk):
+                    Bc = self._bfield_vec(pts_arr[ci:ci+chunk].astype(np.float64))
+                    B_chunks.append(np.linalg.norm(Bc, axis=1).astype(np.float32))
+                all_lines.append(pts_arr)
+                all_B.append(np.concatenate(B_chunks))
+
+        if progress_callback:
+            progress_callback(100)
+        return all_lines, all_B
+
+    def compute_bfield_midplane(self, grid_size=80, margin=1.5,
+                                 axis_offset=0.0, progress_callback=None):
+        """
+        Compute |B| on the 2D cross-sectional plane through the coil centroid,
+        perpendicular to the PCA axis.
+
+        Returns
+        -------
+        X, Y    : (grid_size, grid_size) 2D coordinate grids in the plane basis
+        B_plane : (grid_size, grid_size) |B| values in Tesla
+        e1, e2  : (3,) orthonormal basis vectors spanning the plane
+        center  : (3,) world-space origin of the plane (== mean_point)
+        R       : float  — grid half-width in metres
+        """
+        a      = self.axis / np.linalg.norm(self.axis)
+        helper = np.array([0, 0, 1.0]) if abs(a[2]) < 0.9 else np.array([0, 1.0, 0])
+        e1     = np.cross(a, helper);  e1 /= np.linalg.norm(e1);  e1 = -e1
+        e2     = np.cross(a, e1)
+
+        R_coil = float(np.max(np.linalg.norm(self.midpoints - self.mean_point, axis=1)))
+        R      = R_coil * margin
+
+        lin    = np.linspace(-R, R, grid_size)
+        X, Y   = np.meshgrid(lin, lin, indexing='ij')  # (gs, gs)
+
+        center = self.mean_point + axis_offset * a
+        P    = (center
+                + X[..., None] * e1[None, None, :]
+                + Y[..., None] * e2[None, None, :])      # (gs, gs, 3)
+        pts  = P.reshape(-1, 3)
+
+        N      = len(pts)
+        B_flat = np.empty(N, dtype=np.float64)
+        chunk  = 2000
+        n_ch   = max(1, (N + chunk - 1) // chunk)
+        for ci in range(n_ch):
+            sl          = slice(ci * chunk, min((ci + 1) * chunk, N))
+            B_flat[sl]  = np.linalg.norm(self._bfield_vec(pts[sl]), axis=1)
+            if progress_callback:
+                progress_callback(int(100 * (ci + 1) / n_ch))
+
+        B_plane = B_flat.reshape(grid_size, grid_size)
+        return X, Y, B_plane, e1, e2, center, R

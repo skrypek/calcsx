@@ -1,44 +1,63 @@
-# main.py
+# primary/main_utils.py
+"""
+Fusion 360-style workbench layout for CalcSX.
+
+Structure
+─────────
+  MainWindow
+  └── QWidget (central)
+        ├── RibbonBar          (top, ~88 px) — tabbed tool groups
+        └── QSplitter (H)
+              ├── QWidget (left, ~250 px)
+              │     ├── BrowserPanel   — collapsible layer tree, eye-icon toggles
+              │     └── PropertiesPanel — coil parameters + results summary
+              └── Workspace3DView    — single persistent matplotlib Axes3D
+"""
+
 import sys
 import os
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
+from string import Template
 
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
     QFormLayout,
     QPushButton,
     QSpinBox,
     QDoubleSpinBox,
     QFileDialog,
-    QStackedWidget,
     QCheckBox,
-    QToolButton,
     QTextBrowser,
     QDialog,
     QLabel,
-    QHBoxLayout
+    QFrame,
+    QScrollArea,
+    QSplitter,
+    QMessageBox,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QSizePolicy,
 )
-
-from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QPainter, QPalette
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal, pyqtSlot, QSize
+from PyQt5.QtGui import QPixmap
 
 from physics.physics_utils import CoilAnalysis
-from gui.gui_utils import make_canvas, LogoMixin, ProgressReporter
-from results.results_page import ResultsPage
+from gui.gui_utils import ProgressReporter, THEME
+from views.workspace_3d import Workspace3DView
 
-from string import Template
 from version import __version__ as version_module
 __version__ = getattr(version_module, "__version__", "UNKNOWN")
 
-# turn off interactive mode so canvases render offscreen
-plt.ioff()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background workers
+# ─────────────────────────────────────────────────────────────────────────────
 
 class AnalysisWorker(QObject):
     progress = pyqtSignal(int)
@@ -46,14 +65,13 @@ class AnalysisWorker(QObject):
     finished = pyqtSignal(object)
 
     def __init__(self, coords, winds, current, thickness, width,
-                 compute_bfield, use_gauss, n_grid=120, axis_num=200):
+                 use_gauss, n_grid=120, axis_num=200):
         super().__init__()
         self.coords    = coords
         self.winds     = winds
         self.current   = current
         self.thickness = thickness
         self.width     = width
-        self.compute_b = compute_bfield
         self.use_gauss = use_gauss
         self.n_grid    = int(n_grid)
         self.axis_num  = int(axis_num)
@@ -61,251 +79,723 @@ class AnalysisWorker(QObject):
     @pyqtSlot()
     def run(self):
         engine = CoilAnalysis(
-            self.coords,
-            self.winds,
-            self.current,
-            self.thickness,
-            self.width
+            self.coords, self.winds, self.current,
+            self.thickness, self.width,
         )
         engine.run_analysis(
-            compute_bfield=self.compute_b,
+            compute_bfield=False,
             use_gauss=self.use_gauss,
             n_grid=self.n_grid,
             axis_num=self.axis_num,
             progress_callback=self.progress.emit,
-            stage_callback=self.stage.emit
+            stage_callback=self.stage.emit,
         )
         self.finished.emit(engine)
 
-class LandingPage(LogoMixin, QWidget):
-    def __init__(self, logo_path):
-        QWidget.__init__(self)
-        LogoMixin.__init__(self, logo_path)
 
-        # === Input form ===
-        form = QFormLayout()
-        self.spin_winds    = QSpinBox();      self.spin_winds.setRange(1,10000);  self.spin_winds.setValue(200)
-        self.dspin_current = QDoubleSpinBox();self.dspin_current.setRange(0,1e6); self.dspin_current.setDecimals(1); self.dspin_current.setValue(300)
-        self.dspin_thick   = QDoubleSpinBox();self.dspin_thick.setRange(0,1e6);   self.dspin_thick.setDecimals(1);   self.dspin_thick.setValue(80.0)
-        self.dspin_width   = QDoubleSpinBox();self.dspin_width.setRange(0.1,100); self.dspin_width.setDecimals(2); self.dspin_width.setValue(4.00)
-        form.addRow("Number of Winds:",     self.spin_winds)
-        form.addRow("Current (A):",         self.dspin_current)
-        form.addRow("Tape Thickness (µm):", self.dspin_thick)
-        form.addRow("Tape Width (mm):",     self.dspin_width)
 
-        # On-axis sample count (always visible)
-        self.spin_axis_pts = QSpinBox()
-        self.spin_axis_pts.setRange(50, 1000)
-        self.spin_axis_pts.setSingleStep(50)
-        self.spin_axis_pts.setValue(200)
-        form.addRow("On-Axis Samples:", self.spin_axis_pts)
+class FieldLinesWorker(QObject):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(object)   # (lines, B_mags) tuple
 
-        self.chk_bdist = QCheckBox("Calculate B‑field Cross-section")
-        form.addRow("", self.chk_bdist)
+    def __init__(self, engine, n_seeds: int):
+        super().__init__()
+        self.engine  = engine
+        self.n_seeds = int(n_seeds)
 
-        # --- Threshold (spin box only) ---
-        self.spin_thresh = QDoubleSpinBox()
-        self.spin_thresh.setRange(0.01, 20.00)
-        self.spin_thresh.setSingleStep(0.01)
-        self.spin_thresh.setDecimals(2)
-        self.spin_thresh.setValue(5.00)
-        self.spin_thresh.setEnabled(False)
-
-        self.lbl_thresh = QLabel("Cross‑section max |B|:")
-        self.lbl_thresh.setEnabled(False)
-
-        # --- Grid resolution (only enabled with cross-section) ---
-        self.spin_grid_res = QSpinBox()
-        self.spin_grid_res.setRange(32, 512)
-        self.spin_grid_res.setSingleStep(8)
-        self.spin_grid_res.setValue(120)
-        self.spin_grid_res.setEnabled(False)
-
-        self.lbl_grid_res = QLabel("Cross‑section Grid (pts/axis):")
-        self.lbl_grid_res.setEnabled(False)
-
-        # Enable/disable cross-section controls when checkbox toggles
-        def _toggle_thresh(state):
-            enabled = (state == Qt.Checked)
-            self.spin_thresh.setEnabled(enabled)
-            self.lbl_thresh.setEnabled(enabled)
-            self.spin_grid_res.setEnabled(enabled)
-            self.lbl_grid_res.setEnabled(enabled)
-
-        self.chk_bdist.stateChanged.connect(_toggle_thresh)
-
-        # Threshold row
-        h_thresh = QHBoxLayout()
-        h_thresh.addWidget(self.lbl_thresh)
-        h_thresh.addWidget(self.spin_thresh)
-        form.addRow("", h_thresh)
-
-        # Grid resolution row
-        h_grid = QHBoxLayout()
-        h_grid.addWidget(self.lbl_grid_res)
-        h_grid.addWidget(self.spin_grid_res)
-        form.addRow("", h_grid)
-
-        self.chk_gauss = QCheckBox("Use Gaussian Quadrature")
-        form.addRow("", self.chk_gauss)
-
-        # === Buttons ===
-        self.btn_load    = QPushButton("Load CSV...")
-        self.btn_preview = QPushButton("Preview Curve"); self.btn_preview.setEnabled(False)
-        self.btn_next    = QPushButton("Generate");      self.btn_next.setEnabled(False)
-
-        # === Assemble layout ===
-        lay = QVBoxLayout(self)
-        lay.addLayout(form)
-        lay.addWidget(self.btn_load)
-        lay.addWidget(self.btn_preview)
-        lay.addWidget(self.btn_next)
-
-        # placeholder 3D canvas
-        self._add_placeholder()
-
-        # connect signals
-        self.btn_load.clicked.connect(self.load_csv)
-        self.btn_preview.clicked.connect(self.preview_curve)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        painter = QPainter(self)
-        self.paint_logo(painter, self)
-
-    def _add_placeholder(self):
-        def placeholder(ax, ctx=None):
-            ax.text2D(0.5, 0.5, "No preview",
-                      ha='center', va='center',
-                      transform=ax.transAxes, fontsize=16)
-            ax.axis('off')
-
-        self.placeholder = make_canvas(placeholder, None, projection='3d')
-        self.layout().addWidget(self.placeholder)
-
-    def load_csv(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select coil CSV", "", "CSV files (*.csv)"
+    @pyqtSlot()
+    def run(self):
+        lines, B_mags = self.engine.compute_field_lines(
+            n_seeds=self.n_seeds,
+            progress_callback=self.progress.emit,
         )
-        if not path:
+        self.finished.emit((lines, B_mags))
+
+
+class CrossSectionWorker(QObject):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(object)   # (X, Y, B_plane, e1, e2, center, R) tuple
+
+    def __init__(self, engine, axis_offset: float = 0.0):
+        super().__init__()
+        self.engine      = engine
+        self.axis_offset = float(axis_offset)
+
+    @pyqtSlot()
+    def run(self):
+        data = self.engine.compute_bfield_midplane(
+            grid_size=80,
+            axis_offset=self.axis_offset,
+            progress_callback=self.progress.emit,
+        )
+        self.finished.emit(data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ribbon toolbar
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _RibbonBtn(QFrame):
+    """
+    54×54 px icon-style ribbon button.
+    Symbol (large) sits above a text label.
+    Hover / press feedback via background fill.
+    """
+    clicked = pyqtSignal()
+
+    def __init__(self, symbol: str, label: str,
+                 enabled: bool = True, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(54, 54)
+        self._enabled = enabled
+        self._pressed = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 6, 2, 3)
+        lay.setSpacing(1)
+
+        self._sym_lbl = QLabel(symbol)
+        self._sym_lbl.setAlignment(Qt.AlignCenter)
+
+        self._txt_lbl = QLabel(label)
+        self._txt_lbl.setAlignment(Qt.AlignCenter)
+        self._txt_lbl.setWordWrap(True)
+
+        lay.addWidget(self._sym_lbl, stretch=1)
+        lay.addWidget(self._txt_lbl)
+
+        self._set_enabled_style(enabled)
+        self._set_bg("transparent")
+
+        if enabled:
+            self.setCursor(Qt.PointingHandCursor)
+
+    # ── Enable/disable ────────────────────────────────────────────────────────
+
+    def set_action_enabled(self, enabled: bool) -> None:
+        self._enabled = enabled
+        self._set_enabled_style(enabled)
+        self.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
+        if not enabled:
+            self._set_bg("transparent")
+
+    def _set_enabled_style(self, enabled: bool) -> None:
+        sym_c = THEME['text']      if enabled else '#4a4a4a'
+        lbl_c = THEME['text_dim'] if enabled else '#3a3a3a'
+        self._sym_lbl.setStyleSheet(
+            f"font-size:15pt; color:{sym_c}; background:transparent;"
+        )
+        self._txt_lbl.setStyleSheet(
+            f"font-size:7pt; color:{lbl_c}; background:transparent;"
+        )
+
+    def _set_bg(self, color: str) -> None:
+        self.setStyleSheet(
+            f"QFrame {{ border-radius:3px; background:{color}; }}"
+        )
+
+    # ── Mouse events ──────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, e):
+        if self._enabled and e.button() == Qt.LeftButton:
+            self._pressed = True
+            self._set_bg(THEME['hi_blue'])
+
+    def mouseReleaseEvent(self, e):
+        if self._enabled and self._pressed:
+            self._pressed = False
+            if self.rect().contains(e.pos()):
+                self._set_bg(THEME['input'])
+                self.clicked.emit()
+            else:
+                self._set_bg("transparent")
+
+    def enterEvent(self, e):
+        if self._enabled and not self._pressed:
+            self._set_bg(THEME['input'])
+
+    def leaveEvent(self, e):
+        if not self._pressed:
+            self._set_bg("transparent")
+
+
+def _vbar() -> QFrame:
+    """Thin vertical separator between ribbon groups."""
+    f = QFrame()
+    f.setFrameShape(QFrame.VLine)
+    f.setFixedWidth(1)
+    f.setStyleSheet(f"color:{THEME['border']};")
+    return f
+
+
+def _ribbon_group(label: str, buttons: list) -> QWidget:
+    """Labeled group of ribbon buttons separated by a group label below."""
+    w   = QWidget()
+    out = QVBoxLayout(w)
+    out.setContentsMargins(4, 4, 4, 0)
+    out.setSpacing(0)
+
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(2)
+    for b in buttons:
+        row.addWidget(b)
+
+    glbl = QLabel(label)
+    glbl.setAlignment(Qt.AlignCenter)
+    glbl.setStyleSheet(
+        f"color:{THEME['text_dim']}; font-size:7pt; "
+        f"border-top:1px solid {THEME['border']}; padding-top:1px;"
+    )
+
+    out.addLayout(row, stretch=1)
+    out.addWidget(glbl)
+    return w
+
+
+class RibbonBar(QWidget):
+    """
+    Two-row ribbon.
+    Row 1 — tab strip (SIMULATION | INSPECT | CONSTRUCT | UTILITIES)
+    Row 2 — tool groups for the active tab
+    """
+    load_csv             = pyqtSignal()
+    run_analysis         = pyqtSignal()
+    compute_field_lines  = pyqtSignal()
+    compute_cross_section = pyqtSignal()
+    show_help            = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(88)
+        self.setStyleSheet(
+            f"background:{THEME['panel']}; "
+            f"border-bottom:1px solid {THEME['border']};"
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Tab strip ─────────────────────────────────────────────────────────
+        tab_bar = QWidget()
+        tab_bar.setFixedHeight(24)
+        tab_bar.setStyleSheet(
+            f"background:{THEME['bg']}; border-bottom:1px solid {THEME['border']};"
+        )
+        tb_lay = QHBoxLayout(tab_bar)
+        tb_lay.setContentsMargins(8, 0, 0, 0)
+        tb_lay.setSpacing(0)
+
+        app_lbl = QLabel(f"  CalcSX™ v{__version__}  ")
+        app_lbl.setStyleSheet(
+            f"color:{THEME['accent']}; font-size:8pt; font-weight:bold; "
+            f"border-right:1px solid {THEME['border']}; padding-right:8px;"
+        )
+        tb_lay.addWidget(app_lbl)
+
+        self._tabs: dict = {}
+        self._active_tab = "SIMULATION"
+        for i, name in enumerate(("SIMULATION", "INSPECT", "CONSTRUCT", "UTILITIES")):
+            btn = QPushButton(name)
+            btn.setFlat(True)
+            btn.setFixedHeight(24)
+            btn.setStyleSheet(self._tab_style(active=(i == 0)))
+            btn.clicked.connect(lambda _, n=name: self._activate(n))
+            self._tabs[name] = btn
+            tb_lay.addWidget(btn)
+        tb_lay.addStretch(1)
+        root.addWidget(tab_bar)
+
+        # ── Tool groups area ──────────────────────────────────────────────────
+        tool_area = QWidget()
+        ta_lay = QHBoxLayout(tool_area)
+        ta_lay.setContentsMargins(4, 0, 4, 0)
+        ta_lay.setSpacing(0)
+
+        # Build tool buttons (each is its own object — no shared widget refs)
+        self._btn_load = _RibbonBtn("▲", "Load\nCSV")
+        self._btn_run  = _RibbonBtn("▶", "Run\nAnalysis")
+        btn_help_sim   = _RibbonBtn("?", "Help")
+
+        # SIMULATION groups
+        self._sim_w = QWidget()
+        sl = QHBoxLayout(self._sim_w)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(4)
+        sl.addWidget(_ribbon_group("FILE",     [self._btn_load]))
+        sl.addWidget(_vbar())
+        sl.addWidget(_ribbon_group("ANALYSIS", [self._btn_run]))
+        sl.addWidget(_vbar())
+        sl.addWidget(_ribbon_group("HELP",     [btn_help_sim]))
+        sl.addStretch(1)
+
+        # INSPECT tab
+        self._btn_field_lines = _RibbonBtn("∿", "Field\nLines",   enabled=False)
+        self._btn_cross_sec   = _RibbonBtn("⊡", "Cross\nSection", enabled=False)
+        self._inspect_w = QWidget()
+        il = QHBoxLayout(self._inspect_w)
+        il.setContentsMargins(8, 0, 0, 0)
+        il.setSpacing(4)
+        il.addWidget(_ribbon_group("FIELD", [
+            self._btn_field_lines,
+            self._btn_cross_sec,
+        ]))
+        il.addStretch(1)
+        self._inspect_w.hide()
+
+        # CONSTRUCT (Tier 2 stub)
+        self._construct_w = QWidget()
+        cl = QHBoxLayout(self._construct_w)
+        cl.setContentsMargins(8, 0, 0, 0)
+        cl.setSpacing(4)
+        cl.addWidget(_ribbon_group("TIER 2", [
+            _RibbonBtn("+", "New\nCoil",       enabled=False),
+            _RibbonBtn("⬡", "Tape\nThickness", enabled=False),
+            _RibbonBtn("⊕", "Edit\nGeometry",  enabled=False),
+        ]))
+        cl.addStretch(1)
+        self._construct_w.hide()
+
+        # UTILITIES (stub)
+        self._util_w = QWidget()
+        ul = QHBoxLayout(self._util_w)
+        ul.setContentsMargins(8, 0, 0, 0)
+        ul.setSpacing(4)
+        btn_help_util = _RibbonBtn("?", "Help")
+        btn_help_util.clicked.connect(self.show_help)
+        ul.addWidget(_ribbon_group("HELP", [btn_help_util]))
+        ul.addStretch(1)
+        self._util_w.hide()
+
+        self._tab_widgets = {
+            "SIMULATION": self._sim_w,
+            "INSPECT":    self._inspect_w,
+            "CONSTRUCT":  self._construct_w,
+            "UTILITIES":  self._util_w,
+        }
+        for w in self._tab_widgets.values():
+            ta_lay.addWidget(w)
+
+        root.addWidget(tool_area, stretch=1)
+
+        # Wire signals
+        self._btn_load.clicked.connect(self.load_csv)
+        self._btn_run.clicked.connect(self.run_analysis)
+        self._btn_field_lines.clicked.connect(self.compute_field_lines)
+        self._btn_cross_sec.clicked.connect(self.compute_cross_section)
+        btn_help_sim.clicked.connect(self.show_help)
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    def set_run_enabled(self, on: bool) -> None:
+        self._btn_run.set_action_enabled(on)
+
+    def set_inspect_enabled(self, on: bool) -> None:
+        self._btn_field_lines.set_action_enabled(on)
+        self._btn_cross_sec.set_action_enabled(on)
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _activate(self, name: str) -> None:
+        if name == self._active_tab:
             return
+        self._tab_widgets[self._active_tab].hide()
+        self._active_tab = name
+        self._tab_widgets[name].show()
+        for n, btn in self._tabs.items():
+            btn.setStyleSheet(self._tab_style(active=(n == name)))
 
-        df = pd.read_csv(path)
-        if set(['x','y','z']).issubset(df.columns):
-            coords = df[['x','y','z']].values
-        else:
-            coords = df.iloc[:, :3].values
+    @staticmethod
+    def _tab_style(active: bool) -> str:
+        if active:
+            return (
+                f"QPushButton {{ background:transparent; color:{THEME['text']}; "
+                f"border:none; border-bottom:2px solid {THEME['accent']}; "
+                f"padding:0 14px; font-size:8pt; font-weight:600; }}"
+            )
+        return (
+            f"QPushButton {{ background:transparent; color:{THEME['text_dim']}; "
+            f"border:none; border-bottom:2px solid transparent; "
+            f"padding:0 14px; font-size:8pt; }}"
+            f"QPushButton:hover {{ color:{THEME['text']}; "
+            f"background:{THEME['input']}; }}"
+        )
 
-        # close the loop if needed
-        if not np.allclose(coords[0], coords[-1]):
-            coords = np.vstack((coords, coords[0]))
 
-        self.coords        = coords
-        self.current_fname = os.path.basename(path)
-        self.btn_load.setText(f"Uploaded: {self.current_fname}")
-        self.btn_preview.setEnabled(True)
-        self.btn_next.setEnabled(True)
+# ─────────────────────────────────────────────────────────────────────────────
+# Browser panel  (Fusion 360-style layer tree)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def preview_curve(self):
-        if not hasattr(self, 'coords'):
+_GROUPS = ("Coils", "Analysis")
+
+_LAYER_META: dict = {
+    'Coil':          ('Coils',    THEME['accent']),
+    'Forces':        ('Analysis', THEME['accent2']),
+    'Stress':        ('Analysis', '#e05050'),
+    'B Axis':        ('Analysis', '#80d8ff'),
+    'Field Lines':   ('Analysis', '#80ffff'),
+    'Cross Section': ('Analysis', '#ff9800'),
+}
+
+
+class _EyeBtn(QPushButton):
+    """18×18 flat toggle: ● visible / ○ hidden."""
+    def __init__(self, parent=None):
+        super().__init__("●", parent)
+        self.setCheckable(True)
+        self.setChecked(True)
+        self.setFlat(True)
+        self.setFixedSize(18, 18)
+        self._refresh()
+        self.toggled.connect(self._refresh)
+
+    def _refresh(self):
+        c = THEME['text'] if self.isChecked() else THEME['text_dim']
+        self.setStyleSheet(
+            f"QPushButton {{ color:{c}; font-size:9pt; border:none; "
+            f"background:transparent; }}"
+        )
+
+
+class BrowserPanel(QWidget):
+    """
+    Fusion 360-style browser: collapsible groups with eye-icon toggles.
+    Emits layer_toggled(name: str, visible: bool).
+    """
+    layer_toggled = pyqtSignal(str, bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Header
+        hdr = QLabel("  BROWSER")
+        hdr.setFixedHeight(22)
+        hdr.setStyleSheet(
+            f"background:{THEME['bg']}; color:{THEME['text_dim']}; "
+            f"font-size:7pt; letter-spacing:2px; "
+            f"border-bottom:1px solid {THEME['border']};"
+        )
+        root.addWidget(hdr)
+
+        # Tree
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.setColumnCount(1)
+        self._tree.setIndentation(14)
+        self._tree.setAnimated(True)
+        self._tree.setStyleSheet(f"""
+            QTreeWidget {{
+                background:{THEME['panel']};
+                border:none;
+                outline:none;
+            }}
+            QTreeWidget::item {{
+                height:22px;
+                padding:0;
+            }}
+            QTreeWidget::item:selected {{
+                background:{THEME['hi_blue']};
+            }}
+        """)
+        root.addWidget(self._tree, stretch=1)
+
+        # Group items (always present)
+        self._group_items: dict = {}
+        self._layer_items: dict = {}
+        self._eye_btns:    dict = {}
+        self._group_eyes:  dict = {}
+
+        for grp in _GROUPS:
+            g = QTreeWidgetItem()
+            g.setFlags(Qt.ItemIsEnabled)
+            self._tree.addTopLevelItem(g)
+            g.setExpanded(True)
+
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            lay.setContentsMargins(2, 0, 2, 0)
+            lay.setSpacing(4)
+
+            g_eye = _EyeBtn()
+            g_eye.toggled.connect(
+                lambda checked, gname=grp: self._group_eye_toggled(gname, checked)
+            )
+            self._group_eyes[grp] = g_eye
+            lay.addWidget(g_eye)
+
+            g_lbl = QLabel(grp.upper())
+            g_lbl.setStyleSheet(
+                f"color:{THEME['text_dim']}; font-size:8pt; "
+                f"font-weight:600; letter-spacing:1px;"
+            )
+            lay.addWidget(g_lbl, stretch=1)
+
+            self._tree.setItemWidget(g, 0, w)
+            g.setSizeHint(0, QSize(0, 22))
+            self._group_items[grp] = g
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    def add_layer(self, name: str) -> None:
+        if name in self._layer_items or name not in _LAYER_META:
             return
-        # remove old canvases
-        for w in self.findChildren(FigureCanvas):
-            self.layout().removeWidget(w)
-            w.deleteLater()
-        def simple_preview(ax, ctx=None):
-            ax.plot(self.coords[:,0], self.coords[:,1], self.coords[:,2],
-                    color='black', lw=2)
-            ax.axis('off')
-            name = getattr(self, 'current_fname', 'Coil')
-            fs = max(8, min(12, 200 // len(name)))
-            ax.set_title(name, fontsize=fs)
-            
-            # Equal axis scaling
-            try:
-                coords = self.coords
-                x_min, x_max = np.min(coords[:, 0]), np.max(coords[:, 0])
-                y_min, y_max = np.min(coords[:, 1]), np.max(coords[:, 1])
-                z_min, z_max = np.min(coords[:, 2]), np.max(coords[:, 2])
-                x_range = max(x_max - x_min, 1e-10)
-                y_range = max(y_max - y_min, 1e-10)
-                z_range = max(z_max - z_min, 1e-10)
-                max_range = max(x_range, y_range, z_range)
-                x_center = (x_min + x_max) / 2
-                y_center = (y_min + y_max) / 2
-                z_center = (z_min + z_max) / 2
-                half_range = (max_range + max_range * 0.1) / 2
-                ax.set_xlim(x_center - half_range, x_center + half_range)
-                ax.set_ylim(y_center - half_range, y_center + half_range)
-                ax.set_zlim(z_center - half_range, z_center + half_range)
-                ax.set_box_aspect((1,1,1))
-            except:
-                pass
-        canvas = make_canvas(simple_preview, None, projection='3d')
-        self.layout().insertWidget(4, canvas)
-        
-    def reset(self):
-        # remove ALL canvases (including placeholder)
-        for cv in self.findChildren(FigureCanvas):
-            self.layout().removeWidget(cv)
-            cv.deleteLater()
-        # add back exactly one placeholder
-        self._add_placeholder()
-        # reset controls
-        self.btn_load.setText("Load CSV...")
-        self.btn_preview.setEnabled(False)
-        self.btn_next.setEnabled(False)
-        self.spin_axis_pts.setValue(200)
-        self.chk_bdist.setChecked(False)
-        self.spin_thresh.setValue(5.00)
-        self.spin_thresh.setEnabled(False)
-        self.lbl_thresh.setEnabled(False)
-        self.spin_grid_res.setValue(120)
-        self.spin_grid_res.setEnabled(False)
-        self.lbl_grid_res.setEnabled(False)
-        self.chk_gauss.setChecked(False)
-        # drop stored data
-        if hasattr(self, 'coords'):
-            del self.coords
-        if hasattr(self, 'current_fname'):
-            del self.current_fname
-            
-    def get_cross_section_threshold(self) -> float:
-        return self.spin_thresh.value()
+        grp, color = _LAYER_META[name]
+        parent = self._group_items[grp]
 
-    def get_grid_resolution(self) -> int:
-        return self.spin_grid_res.value()
+        item = QTreeWidgetItem(parent)
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
 
-    def get_axis_samples(self) -> int:
-        return self.spin_axis_pts.value()
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(4)
 
+        eye = _EyeBtn()
+        eye.toggled.connect(
+            lambda checked, n=name: self.layer_toggled.emit(n, checked)
+        )
+        self._eye_btns[name] = eye
+        lay.addWidget(eye)
+
+        swatch = QLabel()
+        swatch.setFixedSize(10, 10)
+        swatch.setStyleSheet(f"background:{color}; border-radius:1px;")
+        lay.addWidget(swatch)
+
+        n_lbl = QLabel(name)
+        n_lbl.setStyleSheet(f"color:{THEME['text']}; font-size:8pt;")
+        lay.addWidget(n_lbl, stretch=1)
+
+        self._tree.setItemWidget(item, 0, w)
+        item.setSizeHint(0, QSize(0, 22))
+        self._layer_items[name] = item
+        parent.setExpanded(True)
+
+    def remove_layer(self, name: str) -> None:
+        if name not in self._layer_items:
+            return
+        item = self._layer_items.pop(name)
+        self._eye_btns.pop(name, None)
+        grp = _LAYER_META[name][0]
+        self._group_items[grp].removeChild(item)
+
+    def remove_all_layers(self) -> None:
+        for name in list(self._layer_items.keys()):
+            self.remove_layer(name)
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _group_eye_toggled(self, group: str, checked: bool) -> None:
+        for name, (grp, _) in _LAYER_META.items():
+            if grp == group and name in self._eye_btns:
+                btn = self._eye_btns[name]
+                btn.blockSignals(True)
+                btn.setChecked(checked)
+                btn.blockSignals(False)
+                self.layer_toggled.emit(name, checked)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Properties panel  (coil parameters + results summary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PropertiesPanel(QScrollArea):
+    """
+    Bottom section of the left sidebar.
+    Coil parameters (always shown after CSV load) + results summary (after analysis).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.NoFrame)
+
+        inner = QWidget()
+        self.setWidget(inner)
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(4)
+
+        hdr = QLabel("  PROPERTIES")
+        hdr.setStyleSheet(
+            f"color:{THEME['text_dim']}; font-size:7pt; letter-spacing:2px;"
+        )
+        lay.addWidget(hdr)
+
+        # Coil parameter form
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
+        form.setSpacing(4)
+        form.setContentsMargins(0, 2, 0, 0)
+
+        self.spin_winds    = QSpinBox()
+        self.spin_winds.setRange(1, 10_000);   self.spin_winds.setValue(200)
+
+        self.dspin_current = QDoubleSpinBox()
+        self.dspin_current.setRange(0, 1e6);   self.dspin_current.setDecimals(1);  self.dspin_current.setValue(300.0)
+
+        self.dspin_thick   = QDoubleSpinBox()
+        self.dspin_thick.setRange(0, 1e6);     self.dspin_thick.setDecimals(1);    self.dspin_thick.setValue(80.0)
+
+        self.dspin_width   = QDoubleSpinBox()
+        self.dspin_width.setRange(0.1, 100);   self.dspin_width.setDecimals(2);    self.dspin_width.setValue(4.00)
+
+        self.spin_axis_pts = QSpinBox()
+        self.spin_axis_pts.setRange(50, 1000); self.spin_axis_pts.setSingleStep(50); self.spin_axis_pts.setValue(200)
+
+        self.chk_gauss            = QCheckBox("Gaussian Quadrature")
+        self.chk_normalize_forces = QCheckBox("Normalize Force Vectors")
+
+        form.addRow("Winds:",           self.spin_winds)
+        form.addRow("Current (A):",     self.dspin_current)
+        form.addRow("Tape Thick (µm):", self.dspin_thick)
+        form.addRow("Tape Width (mm):", self.dspin_width)
+        form.addRow("Axis Samples:",    self.spin_axis_pts)
+        form.addRow("",                 self.chk_gauss)
+        form.addRow("",                 self.chk_normalize_forces)
+        lay.addLayout(form)
+
+        # INSPECT — field line seeds
+        lay.addWidget(_hdivider())
+        irow = QHBoxLayout()
+        irow.setContentsMargins(0, 0, 0, 0)
+        irow.setSpacing(6)
+        ilbl = QLabel("Field Seeds:")
+        ilbl.setStyleSheet(f"color:{THEME['text_dim']}; font-size:8pt;")
+        self.spin_field_seeds = QSpinBox()
+        self.spin_field_seeds.setRange(8, 60)
+        self.spin_field_seeds.setSingleStep(4)
+        self.spin_field_seeds.setValue(20)
+        irow.addWidget(ilbl)
+        irow.addWidget(self.spin_field_seeds, stretch=1)
+        lay.addLayout(irow)
+
+        srow = QHBoxLayout()
+        srow.setContentsMargins(0, 0, 0, 0)
+        srow.setSpacing(6)
+        slbl = QLabel("Section Pos. (m):")
+        slbl.setStyleSheet(f"color:{THEME['text_dim']}; font-size:8pt;")
+        self.dspin_cs_offset = QDoubleSpinBox()
+        self.dspin_cs_offset.setRange(-5.0, 5.0)
+        self.dspin_cs_offset.setSingleStep(0.01)
+        self.dspin_cs_offset.setDecimals(3)
+        self.dspin_cs_offset.setValue(0.0)
+        srow.addWidget(slbl)
+        srow.addWidget(self.dspin_cs_offset, stretch=1)
+        lay.addLayout(srow)
+
+        lay.addWidget(_hdivider())
+
+        # Results summary (shown after analysis)
+        self._sum_w = QWidget()
+        self._sum_w.hide()
+        sl = QVBoxLayout(self._sum_w)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(2)
+
+        sl.addWidget(_section_lbl("RESULTS"))
+        self._sum_lbls: dict = {}
+        for key in ("B cent.", "B axial", "Peak |B|", "Peak F", "Peak σ", "Arc len."):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            kl = QLabel(key + ":")
+            kl.setStyleSheet(
+                f"color:{THEME['text_dim']}; font-size:8pt; min-width:52px;"
+            )
+            vl = QLabel("—")
+            vl.setStyleSheet(
+                f"color:{THEME['accent']}; font-size:8pt; font-weight:bold;"
+            )
+            self._sum_lbls[key] = vl
+            row.addWidget(kl)
+            row.addWidget(vl, stretch=1)
+            sl.addLayout(row)
+
+        lay.addWidget(self._sum_w)
+        lay.addStretch()
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    def get_params(self) -> dict:
+        return {
+            'winds':     self.spin_winds.value(),
+            'current':   self.dspin_current.value(),
+            'thickness': self.dspin_thick.value(),
+            'width':     self.dspin_width.value(),
+            'use_gauss': self.chk_gauss.isChecked(),
+            'axis_num':  self.spin_axis_pts.value(),
+        }
+
+    def get_field_seeds(self) -> int:
+        return self.spin_field_seeds.value()
+
+    def get_cs_offset(self) -> float:
+        return self.dspin_cs_offset.value()
+
+    def update_summary(self, engine) -> None:
+        def _set(key, text):
+            self._sum_lbls[key].setText(text)
+        try:  _set("B cent.",  f"{engine.B_magnitude:.4f} T")
+        except Exception: pass
+        try:  _set("B axial",  f"{engine.B_axial:.4f} T")
+        except Exception: pass
+        try:
+            if engine.bfield_axis_mag is not None:
+                mag = np.asarray(engine.bfield_axis_mag)
+                z   = np.asarray(engine.bfield_axis_z)
+                idx = int(np.argmax(mag))
+                _set("Peak |B|", f"{mag[idx]:.4f} T @ {z[idx]:+.3f} m")
+        except Exception: pass
+        try:
+            F = np.asarray(engine.F_mags)
+            _set("Peak F",  f"{F.max()/1000:.2f} kN/m")
+        except Exception: pass
+        try:
+            s = np.asarray(engine.hoop_stress)
+            _set("Peak σ",  f"{s.max()/1e6:.2f} MPa")
+        except Exception: pass
+        try:
+            total = float(np.sum(
+                np.linalg.norm(np.diff(engine.coords, axis=0), axis=1)
+            ))
+            _set("Arc len.", f"{total:.3f} m")
+        except Exception: pass
+        self._sum_w.show()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Help dialog
+# ─────────────────────────────────────────────────────────────────────────────
 
 class HelpDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Help")
-        self.resize(600, 450)
+        self.resize(620, 480)
         layout = QVBoxLayout(self)
+
         browser = QTextBrowser(self)
         browser.setOpenExternalLinks(True)
-        
-        window_color = QApplication.palette().color(QPalette.Window).name()
-        browser.setStyleSheet(f"QTextBrowser {{ background: {window_color}; border: none; }}")
-        
-        if getattr(sys, "frozen", False):
-            BASE_DIR = Path(sys._MEIPASS)          # PyInstaller temp dir
-        else:
-            BASE_DIR = Path(__file__).resolve().parent
-        
-        BASE_DIR = Path(__file__).resolve().parent.parent
-        HELP_FILE = BASE_DIR / "resources" / "html" / "help.txt"
-                
-        raw_html = HELP_FILE.read_text(encoding="utf-8-sig")
-        
-        tmpl = Template(raw_html)
-        HELP_HTML = tmpl.safe_substitute(VERSION=__version__)
-
-        browser.setHtml(HELP_HTML)
+        browser.setStyleSheet(
+            f"QTextBrowser {{ background:{THEME['panel']}; border:none; }}"
+        )
+        BASE_DIR = (
+            Path(sys._MEIPASS) if getattr(sys, "frozen", False)
+            else Path(__file__).resolve().parent.parent
+        )
+        try:
+            raw = (BASE_DIR / "resources" / "html" / "help.txt").read_text(
+                encoding="utf-8-sig"
+            )
+            browser.setHtml(Template(raw).safe_substitute(VERSION=__version__))
+        except Exception:
+            browser.setPlainText("Help file not found.")
         layout.addWidget(browser)
 
         close_btn = QPushButton("Close")
@@ -313,128 +803,242 @@ class HelpDialog(QDialog):
         layout.addWidget(close_btn, alignment=Qt.AlignRight)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main window
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"CalcSX™ – v{__version__}")
-        
-        if getattr(sys, "frozen", False):
-            BASE_DIR = Path(sys._MEIPASS)          # PyInstaller temp dir
-        else:
-            BASE_DIR = Path(__file__).resolve().parent.parent
-        
-        LOGO_PATH = BASE_DIR / "resources" / "images" / "CFRC_white.png"
-        self.landing = LandingPage(str(LOGO_PATH))
-        
-        # Central UI (replace with your existing widget)
-        self.resize(800, 600)
-        
-        self.stack   = QStackedWidget()
+        self.resize(1280, 800)
 
-        self.results = ResultsPage()
+        self._coords   = None
+        self._engine   = None
+        self._a_thread = None
+        self._a_worker = None
+        self._i_thread = None
+        self._i_worker = None
 
-        self.stack.addWidget(self.landing)
-        self.stack.addWidget(self.results)
-        self.setCentralWidget(self.stack)
+        # ── Central widget ────────────────────────────────────────────────────
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_lay = QVBoxLayout(central)
+        main_lay.setContentsMargins(0, 0, 0, 0)
+        main_lay.setSpacing(0)
 
-        # navigation
-        self.landing.btn_next.clicked.connect(self.show_results)
-        self.results.btn_back.clicked.connect(self.show_landing)
+        # ── Ribbon ────────────────────────────────────────────────────────────
+        self.ribbon = RibbonBar()
+        main_lay.addWidget(self.ribbon)
 
+        # ── Workspace splitter ────────────────────────────────────────────────
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        main_lay.addWidget(splitter, stretch=1)
 
-        # (Optional) add menus here
-        # file_menu = menubar.addMenu("File")
-        # help_menu = menubar.addMenu("Help")
-    
-        self.help_btn = QToolButton(self)
-        self.help_btn.setText("?")
-        self.help_btn.setToolTip("Help")
-        self.help_btn.clicked.connect(self.show_help_dialog)
-        self.help_btn.setFixedSize(24, 24)
-        self.help_btn.setStyleSheet(
-            "QToolButton {"
-            "  background: rgba(255,255,255,0.7);"
-            "  border: 1px solid #660;"
-            "  border-radius: 6px;"
-            "  font-weight: bold;"
-            "}"
-            "QToolButton:hover { background: rgba(255,255,255,0.9); }"
+        # Left panel
+        left = QWidget()
+        left.setMinimumWidth(190)
+        left.setMaximumWidth(320)
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(0)
+
+        self.browser = BrowserPanel()
+        self.props   = PropertiesPanel()
+        self.props.hide()
+
+        left_lay.addWidget(self.browser, stretch=3)
+        left_lay.addWidget(_hdivider())
+        left_lay.addWidget(self.props,   stretch=2)
+
+        self.workspace = Workspace3DView()
+
+        splitter.addWidget(left)
+        splitter.addWidget(self.workspace)
+        splitter.setSizes([250, 1030])
+
+        # ── Wire signals ──────────────────────────────────────────────────────
+        self.ribbon.load_csv.connect(self._on_load_csv)
+        self.ribbon.run_analysis.connect(self._on_run_analysis)
+        self.ribbon.compute_field_lines.connect(self._on_compute_field_lines)
+        self.ribbon.compute_cross_section.connect(self._on_compute_cross_section)
+        self.ribbon.show_help.connect(lambda: HelpDialog(self).exec_())
+        self.browser.layer_toggled.connect(self.workspace.set_layer_visible)
+        self.props.chk_normalize_forces.stateChanged.connect(
+            self._on_normalize_forces_toggled
         )
-        self.help_btn.raise_()  # ensure it stays on top
-        
-        self.stack.currentChanged.connect(self._update_help_visibility)
-        self._update_help_visibility(self.stack.currentIndex())
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        # Place button at top-right of client area
-        margin = 6
-        x = self.width() - self.help_btn.width() - margin
-        y = margin
-        self.help_btn.move(x, y)
+    # ── Signal handlers ───────────────────────────────────────────────────────
 
-    def show_help_dialog(self):
-        dlg = HelpDialog(self)
-        dlg.exec_()
+    def _on_load_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select coil CSV", "", "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            df = pd.read_csv(path)
+            coords = (
+                df[['x', 'y', 'z']].values
+                if {'x', 'y', 'z'}.issubset(df.columns)
+                else df.iloc[:, :3].values
+            )
+            if not np.allclose(coords[0], coords[-1]):
+                coords = np.vstack((coords, coords[0]))
+        except Exception as exc:
+            QMessageBox.critical(self, "CSV Error", str(exc))
+            return
 
-    def show_results(self):
-        # disable Generate button
-        self.landing.btn_next.setEnabled(False)
+        fname = os.path.basename(path)
+        self._coords = coords
+        self._engine = None
 
-        # start progress dialog
-        self.reporter = ProgressReporter(self, title="Generating Plots…")
+        self.browser.remove_all_layers()
+        self.workspace.load_coil(coords, fname)
+        self.browser.add_layer('Coil')
+        self.ribbon.set_inspect_enabled(False)
+        self.props.show()
+
+    def _on_run_analysis(self) -> None:
+        if self._coords is None:
+            QMessageBox.information(
+                self, "No Coil", "Load a coil CSV before running analysis."
+            )
+            return
+
+        self.ribbon.set_run_enabled(False)
+        self.workspace.clear_analysis_layers()
+        self.workspace.clear_inspect_layers()
+        for nm in ('Forces', 'Stress', 'B Axis', 'Field Lines', 'Cross Section'):
+            self.browser.remove_layer(nm)
+        self.ribbon.set_inspect_enabled(False)
+
+        params = self.props.get_params()
+        self.reporter = ProgressReporter(self, title="Running Analysis…")
         self.reporter.start()
 
-        # gather parameters
-        coords    = self.landing.coords
-        winds     = self.landing.spin_winds.value()
-        current   = self.landing.dspin_current.value()
-        thick     = self.landing.dspin_thick.value()
-        width     = self.landing.dspin_width.value()
-        want_b    = self.landing.chk_bdist.isChecked()
-        want_gq   = self.landing.chk_gauss.isChecked()
-        n_grid    = self.landing.get_grid_resolution()
-        axis_num  = self.landing.get_axis_samples()
-
-        # set up worker thread
-        self.thread = QThread(self)
-        self.worker = AnalysisWorker(
-            coords, winds, current, thick, width,
-            want_b, want_gq, n_grid, axis_num
+        self._a_thread = QThread(self)
+        self._a_worker = AnalysisWorker(
+            self._coords,
+            params['winds'], params['current'],
+            params['thickness'], params['width'],
+            params['use_gauss'],
+            axis_num=params['axis_num'],
         )
-        self.worker.moveToThread(self.thread)
+        self._a_worker.moveToThread(self._a_thread)
+        self._a_worker.progress.connect(self.reporter.report)
+        self._a_worker.stage.connect(self.reporter.set_stage)
+        self._a_worker.finished.connect(self._on_analysis_done)
+        self._a_worker.finished.connect(self._a_thread.quit)
+        self._a_worker.finished.connect(self._a_worker.deleteLater)
+        self._a_thread.finished.connect(self._a_thread.deleteLater)
+        self._a_thread.started.connect(self._a_worker.run)
+        self._a_thread.start()
 
-        # connect signals
-        self.worker.progress.connect(self.reporter.report)
-        self.worker.stage.connect(self.reporter.set_stage)
-        self.worker.finished.connect(lambda eng: self.on_analysis_done(eng, want_b))
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-
-        # start analysis
-        self.thread.started.connect(self.worker.run)
-        self.thread.start()
-
-    def on_analysis_done(self, engine, show_b):
-        # finish progress dialog
+    def _on_analysis_done(self, engine) -> None:
         self.reporter.finish()
-        
-        if show_b:
-            engine.cross_section_threshold = self.landing.get_cross_section_threshold()
+        self._engine   = engine
+        self._a_thread = None
+        self._a_worker = None
 
-        # show results
-        self.results.setup(engine, show_b)
-        self.stack.setCurrentWidget(self.results)
+        norm = self.props.chk_normalize_forces.isChecked()
+        self.workspace.add_force_layer(engine, normalized=norm)
+        self.workspace.add_stress_layer(engine)
+        self.workspace.add_axis_layer(engine)
 
-        # re-enable Generate
-        self.landing.btn_next.setEnabled(True)
+        for nm in ('Forces', 'Stress', 'B Axis'):
+            self.browser.add_layer(nm)
 
-    def show_landing(self):
-        self.landing.reset()
-        self.stack.setCurrentWidget(self.landing)
-        
-    def _update_help_visibility(self, index: int):
-        # Show only when landing page is active
-        self.help_btn.setVisible(self.stack.widget(index) is self.landing)
+        self.props.update_summary(engine)
+        self.ribbon.set_run_enabled(True)
+        self.ribbon.set_inspect_enabled(True)
+
+    def _on_normalize_forces_toggled(self) -> None:
+        """Re-render the Forces layer whenever the normalize checkbox changes."""
+        if self._engine is None:
+            return
+        norm = self.props.chk_normalize_forces.isChecked()
+        self.workspace.add_force_layer(self._engine, normalized=norm)
+
+    def _on_compute_field_lines(self) -> None:
+        if self._engine is None:
+            QMessageBox.warning(self, "No Analysis",
+                                "Run a full analysis first.")
+            return
+        if self._i_thread is not None and self._i_thread.isRunning():
+            return
+        self.workspace.clear_field_lines_layer()
+        self.browser.remove_layer('Field Lines')
+        n_seeds = self.props.get_field_seeds()
+        self._inspect_reporter = ProgressReporter(self, title="Computing Field Lines…")
+        self._inspect_reporter.start()
+        self._i_thread = QThread(self)
+        self._i_worker = FieldLinesWorker(self._engine, n_seeds)
+        self._i_worker.moveToThread(self._i_thread)
+        self._i_worker.progress.connect(self._inspect_reporter.report)
+        self._i_worker.finished.connect(self._on_field_lines_done)
+        self._i_worker.finished.connect(self._i_thread.quit)
+        self._i_worker.finished.connect(self._i_worker.deleteLater)
+        self._i_thread.finished.connect(self._i_thread.deleteLater)
+        self._i_thread.started.connect(self._i_worker.run)
+        self._i_thread.start()
+
+    def _on_field_lines_done(self, data) -> None:
+        self._inspect_reporter.finish()
+        self._i_thread = None
+        self._i_worker = None
+        lines, B_mags = data
+        self.workspace.add_field_lines_layer(lines, B_mags)
+        self.browser.add_layer('Field Lines')
+
+    def _on_compute_cross_section(self) -> None:
+        if self._engine is None:
+            QMessageBox.warning(self, "No Analysis",
+                                "Run a full analysis first.")
+            return
+        if self._i_thread is not None and self._i_thread.isRunning():
+            return
+        self.workspace.clear_cross_section_layer()
+        self.browser.remove_layer('Cross Section')
+        axis_offset = self.props.get_cs_offset()
+        self._inspect_reporter = ProgressReporter(self, title="Computing Cross Section…")
+        self._inspect_reporter.start()
+        self._i_thread = QThread(self)
+        self._i_worker = CrossSectionWorker(self._engine, axis_offset=axis_offset)
+        self._i_worker.moveToThread(self._i_thread)
+        self._i_worker.progress.connect(self._inspect_reporter.report)
+        self._i_worker.finished.connect(self._on_cross_section_done)
+        self._i_worker.finished.connect(self._i_thread.quit)
+        self._i_worker.finished.connect(self._i_worker.deleteLater)
+        self._i_thread.finished.connect(self._i_thread.deleteLater)
+        self._i_thread.started.connect(self._i_worker.run)
+        self._i_thread.start()
+
+    def _on_cross_section_done(self, data) -> None:
+        self._inspect_reporter.finish()
+        self._i_thread = None
+        self._i_worker = None
+        X, Y, B_plane, e1, e2, center, R = data
+        self.workspace.add_cross_section_layer(X, Y, B_plane, e1, e2, center, R)
+        self.browser.add_layer('Cross Section')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hdivider() -> QFrame:
+    d = QFrame()
+    d.setFrameShape(QFrame.HLine)
+    d.setFrameShadow(QFrame.Sunken)
+    d.setStyleSheet(f"color:{THEME['border']};")
+    return d
+
+
+def _section_lbl(text: str) -> QLabel:
+    l = QLabel(text)
+    l.setStyleSheet(
+        f"color:{THEME['text_dim']}; font-size:7pt; letter-spacing:1.5px;"
+    )
+    return l

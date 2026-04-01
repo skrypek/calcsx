@@ -1,14 +1,229 @@
 # gui_utils.py
 import matplotlib.pyplot as plt
-from PyQt5.QtCore import Qt, QTimer, QObject
-from PyQt5.QtGui import QPainter, QPixmap
+from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
+from PyQt5.QtGui import QPainter, QPixmap, QPalette, QColor, QFont, QFontDatabase
 import random
 import time
-from PyQt5.QtWidgets import QProgressDialog, QApplication, QLabel
+from PyQt5.QtWidgets import (
+    QProgressDialog, QApplication, QLabel,
+    QHBoxLayout, QPushButton, QVBoxLayout, QWidget, QFileDialog, QSizePolicy,
+)
 from pathlib import Path
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 
-# load and cache the pixmap once (deferred until QApplication exists)
+# ─────────────────────────────────────────────────────────────
+# Colour palette (single source of truth for all modules)
+# ─────────────────────────────────────────────────────────────
+THEME = {
+    'bg':       '#1e1e1e',   # VS-Code dark — main window / figure background
+    'panel':    '#252526',   # sidebar / plot area background
+    'input':    '#3c3c3c',   # spin-box / text-field background
+    'border':   '#474747',   # separator lines
+    'text':     '#d4d4d4',   # primary text
+    'text_dim': '#808080',   # secondary / disabled text
+    'accent':   '#4dd0e1',   # cyan — coil lines, active borders, highlight
+    'accent2':  '#ce9178',   # warm orange — secondary plot lines
+    'success':  '#4ec9b0',   # teal — "done" states
+    'warning':  '#dcdcaa',   # yellow — warning states
+    'hi_blue':  '#264f78',   # selection highlight
+    'gen_btn':  '#007acc',   # generate button face
+}
+
+# ─────────────────────────────────────────────────────────────
+# Application-level dark setup helpers
+# ─────────────────────────────────────────────────────────────
+
+def build_dark_palette() -> QPalette:
+    """Return a QPalette matching THEME for use with Fusion style."""
+    p = QPalette()
+    bg      = QColor(THEME['bg'])
+    panel   = QColor(THEME['panel'])
+    inp     = QColor(THEME['input'])
+    txt     = QColor(THEME['text'])
+    dim     = QColor(THEME['text_dim'])
+    hi      = QColor(THEME['hi_blue'])
+    white   = QColor('#ffffff')
+
+    p.setColor(QPalette.Window,           bg)
+    p.setColor(QPalette.WindowText,       txt)
+    p.setColor(QPalette.Base,             inp)
+    p.setColor(QPalette.AlternateBase,    panel)
+    p.setColor(QPalette.ToolTipBase,      panel)
+    p.setColor(QPalette.ToolTipText,      txt)
+    p.setColor(QPalette.Text,             txt)
+    p.setColor(QPalette.Button,           panel)
+    p.setColor(QPalette.ButtonText,       txt)
+    p.setColor(QPalette.BrightText,       white)
+    p.setColor(QPalette.Highlight,        hi)
+    p.setColor(QPalette.HighlightedText,  white)
+    p.setColor(QPalette.Link,             QColor(THEME['accent']))
+
+    p.setColor(QPalette.Disabled, QPalette.Text,       dim)
+    p.setColor(QPalette.Disabled, QPalette.ButtonText,  dim)
+    p.setColor(QPalette.Disabled, QPalette.WindowText,  dim)
+    return p
+
+
+def pick_mono_font(size: int = 9) -> QFont:
+    """Return the best available monospace font for the terminal aesthetic."""
+    families = set(QFontDatabase().families())
+    candidates = [
+        "JetBrains Mono", "Cascadia Code", "Fira Code", "Source Code Pro",
+        "SF Mono", "Consolas", "Menlo", "DejaVu Sans Mono", "Courier New",
+    ]
+    for name in candidates:
+        if name in families:
+            return QFont(name, size)
+    f = QFont()
+    f.setStyleHint(QFont.Monospace)
+    f.setPointSize(size)
+    return f
+
+
+def apply_mpl_dark_theme() -> None:
+    """Set matplotlib rcParams to match the dark THEME.  Call once at startup."""
+    plt.rcParams.update({
+        'figure.facecolor':   THEME['bg'],
+        'axes.facecolor':     THEME['panel'],
+        'axes.edgecolor':     THEME['border'],
+        'axes.labelcolor':    THEME['text'],
+        'axes.titlecolor':    THEME['text'],
+        'text.color':         THEME['text'],
+        'xtick.color':        THEME['text'],
+        'ytick.color':        THEME['text'],
+        'grid.color':         THEME['input'],
+        'grid.linestyle':     '--',
+        'grid.alpha':         0.45,
+        'legend.facecolor':   THEME['panel'],
+        'legend.edgecolor':   THEME['border'],
+        'legend.labelcolor':  THEME['text'],
+        'font.family':        'monospace',
+        'axes.prop_cycle':    plt.cycler(color=[
+            THEME['accent'], THEME['accent2'],
+            THEME['success'], THEME['warning'],
+        ]),
+        'lines.linewidth':    1.6,
+    })
+
+
+# Global QSS stylesheet (loaded once from main.py)
+APP_QSS = f"""
+QWidget {{
+    background-color: {THEME['bg']};
+    color: {THEME['text']};
+}}
+/* ── scrollbar ── */
+QScrollBar:vertical {{
+    background: {THEME['panel']}; width: 8px; border: none;
+}}
+QScrollBar::handle:vertical {{
+    background: {THEME['border']}; border-radius: 4px; min-height: 20px;
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar:horizontal {{
+    background: {THEME['panel']}; height: 8px; border: none;
+}}
+QScrollBar::handle:horizontal {{
+    background: {THEME['border']}; border-radius: 4px; min-width: 20px;
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+/* ── splitter ── */
+QSplitter::handle {{
+    background: {THEME['border']}; width: 2px; height: 2px;
+}}
+/* ── tabs ── */
+QTabWidget::pane {{
+    border: 1px solid {THEME['border']}; background: {THEME['bg']};
+}}
+QTabBar::tab {{
+    background: {THEME['panel']}; color: {THEME['text_dim']};
+    padding: 6px 14px; border: 1px solid {THEME['border']}; border-bottom: none;
+    margin-right: 2px;
+}}
+QTabBar::tab:selected {{
+    background: {THEME['bg']}; color: {THEME['text']};
+    border-bottom: 2px solid {THEME['accent']};
+}}
+QTabBar::tab:hover {{ color: {THEME['text']}; }}
+/* ── buttons ── */
+QPushButton {{
+    background: {THEME['panel']}; border: 1px solid {THEME['border']};
+    border-radius: 3px; padding: 5px 10px; color: {THEME['text']};
+}}
+QPushButton:hover {{ background: {THEME['input']}; border-color: {THEME['accent']}; }}
+QPushButton:pressed {{ background: {THEME['hi_blue']}; }}
+QPushButton:disabled {{ color: {THEME['text_dim']}; border-color: #333; background: {THEME['panel']}; }}
+/* generate button gets accent face */
+QPushButton#GenerateButton {{
+    background: {THEME['gen_btn']}; color: #ffffff;
+    border-color: {THEME['gen_btn']}; font-weight: bold;
+}}
+QPushButton#GenerateButton:hover {{ background: #1a8ad4; }}
+QPushButton#GenerateButton:disabled {{
+    background: {THEME['panel']}; color: {THEME['text_dim']};
+    border-color: {THEME['border']};
+}}
+/* ── spin boxes / inputs ── */
+QSpinBox, QDoubleSpinBox {{
+    background: {THEME['input']}; border: 1px solid {THEME['border']};
+    border-radius: 3px; padding: 2px 4px; color: {THEME['text']};
+}}
+QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {THEME['accent']}; }}
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+    background: {THEME['border']}; border: none; width: 14px;
+}}
+/* ── checkboxes ── */
+QCheckBox {{ color: {THEME['text']}; spacing: 6px; }}
+QCheckBox::indicator {{
+    width: 14px; height: 14px;
+    background: {THEME['input']}; border: 1px solid {THEME['border']}; border-radius: 2px;
+}}
+QCheckBox::indicator:checked {{
+    background: {THEME['accent']}; border-color: {THEME['accent']};
+}}
+/* ── labels ── */
+QLabel {{ color: {THEME['text']}; background: transparent; }}
+/* ── summary card ── */
+QFrame#SummaryCard {{
+    background: {THEME['panel']}; border: 1px solid {THEME['border']};
+    border-radius: 4px;
+}}
+/* ── parameter panel ── */
+QWidget#ParameterPanel {{
+    background: {THEME['panel']}; border-right: 1px solid {THEME['border']};
+}}
+/* ── progress dialog ── */
+QProgressDialog {{
+    background: {THEME['panel']}; border: 1px solid {THEME['border']}; border-radius: 6px;
+}}
+QProgressBar {{
+    background: {THEME['input']}; border: 1px solid {THEME['border']};
+    border-radius: 3px; text-align: center; color: {THEME['text']};
+}}
+QProgressBar::chunk {{ background: {THEME['accent']}; border-radius: 3px; }}
+/* ── slider ── */
+QSlider::groove:horizontal {{
+    background: {THEME['input']}; height: 4px; border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: {THEME['accent']}; width: 12px; height: 12px;
+    margin: -4px 0; border-radius: 6px;
+}}
+QSlider::sub-page:horizontal {{ background: {THEME['accent']}; border-radius: 2px; }}
+/* ── tool button (help ?) ── */
+QToolButton {{
+    background: rgba(255,255,255,0.08); border: 1px solid {THEME['border']};
+    border-radius: 6px; font-weight: bold; color: {THEME['text']};
+}}
+QToolButton:hover {{ background: rgba(255,255,255,0.15); border-color: {THEME['accent']}; }}
+"""
+
+# ─────────────────────────────────────────────────────────────
+# Canvas helpers
+# ─────────────────────────────────────────────────────────────
+
+# load and cache the watermark pixmap once (deferred until QApplication exists)
 _LOGO_PATH = Path(__file__).parent.parent / "resources" / "images" / "powered_by.png"
 _WATERMARK_PM = None
 
@@ -18,150 +233,329 @@ def _get_watermark_pm():
         _WATERMARK_PM = QPixmap(str(_LOGO_PATH))
     return _WATERMARK_PM
 
+
 class WatermarkedCanvas(FigureCanvasQTAgg):
     """
-    FigureCanvas that draws a transparent watermark pixmap in its paintEvent, after Matplotlib 
-    has rendered. Now preserves 3D view state properly.
+    FigureCanvas that overlays a transparent watermark pixmap in paintEvent,
+    after Matplotlib has rendered.  Preserves 3D view state during repaints.
     """
-    
-    def __init__(self, figure, zoom=0.10, pad=0.02, alpha=0.4):
+
+    def __init__(self, figure, zoom=0.10, pad=0.02, alpha=0.35):
         super().__init__(figure)
-        self._zoom = zoom  # fraction of widget width
-        self._pad = pad    # fraction padding from right/bottom
+        self._zoom  = zoom
+        self._pad   = pad
         self._alpha = alpha
-        
-        # Store 3D view state to prevent view changes during repaints
         self._3d_view_state = {}
         self._store_3d_view_state()
-    
+
     def _store_3d_view_state(self):
-        """Store current 3D view state for all 3D axes"""
         self._3d_view_state = {}
         for i, ax in enumerate(self.figure.get_axes()):
-            if hasattr(ax, 'zaxis'):  # It's a 3D axis
+            if hasattr(ax, 'zaxis'):
                 self._3d_view_state[i] = {
-                    'elev': ax.elev,
-                    'azim': ax.azim,
-                    'xlim': ax.get_xlim(),
-                    'ylim': ax.get_ylim(),
-                    'zlim': ax.get_zlim()
+                    'elev': ax.elev, 'azim': ax.azim,
+                    'xlim': ax.get_xlim(), 'ylim': ax.get_ylim(), 'zlim': ax.get_zlim(),
                 }
-    
+
     def _restore_3d_view_state(self):
-        """Restore 3D view state for all 3D axes"""
         for i, ax in enumerate(self.figure.get_axes()):
             if hasattr(ax, 'zaxis') and i in self._3d_view_state:
-                state = self._3d_view_state[i]
-                ax.view_init(elev=state['elev'], azim=state['azim'])
-                ax.set_xlim(state['xlim'])
-                ax.set_ylim(state['ylim'])
-                ax.set_zlim(state['zlim'])
+                s = self._3d_view_state[i]
+                ax.view_init(elev=s['elev'], azim=s['azim'])
+                ax.set_xlim(s['xlim']); ax.set_ylim(s['ylim']); ax.set_zlim(s['zlim'])
 
     def paintEvent(self, event):
-        # Store current 3D view state before matplotlib renders
         self._store_3d_view_state()
-        
-        # Let Matplotlib draw the figure contents
         super().paintEvent(event)
-        
-        # Restore 3D view state after matplotlib render (prevents drift)
         self._restore_3d_view_state()
 
-        # Overlay the watermark via Qt (this should not affect matplotlib state)
         painter = QPainter(self)
         painter.setOpacity(self._alpha)
-
-        w = self.width()
-        h = self.height()
-        # target watermark width in pixels
+        w, h = self.width(), self.height()
         target_w = int(w * self._zoom)
-        scaled = _get_watermark_pm().scaledToWidth(
-            target_w, Qt.SmoothTransformation
-        )
-
-        # pad in pixels
-        pad_x = int(w * self._pad)
-        pad_y = int(h * self._pad)
-
-        # bottom‑right corner
-        x = w - scaled.width() - pad_x
-        y = h - scaled.height() - pad_y
-
-        painter.drawPixmap(x, y, scaled)
+        scaled = _get_watermark_pm().scaledToWidth(target_w, Qt.SmoothTransformation)
+        pad_x, pad_y = int(w * self._pad), int(h * self._pad)
+        painter.drawPixmap(w - scaled.width() - pad_x, h - scaled.height() - pad_y, scaled)
         painter.end()
 
-    def mousePressEvent(self, event):
-        """Override to update stored view state after user interaction"""
-        super().mousePressEvent(event)
-        # Update stored state after any mouse interaction
-        self._store_3d_view_state()
-    
-    def mouseReleaseEvent(self, event):
-        """Override to update stored view state after user interaction"""
-        super().mouseReleaseEvent(event)
-        # Update stored state after any mouse interaction
-        self._store_3d_view_state()
-    
+    def mousePressEvent(self, e):   super().mousePressEvent(e);   self._store_3d_view_state()
+    def mouseReleaseEvent(self, e): super().mouseReleaseEvent(e); self._store_3d_view_state()
+
     def wheelEvent(self, event):
-        """Override to update stored view state after wheel zoom"""
-        super().wheelEvent(event)
-        # Update stored state after any wheel interaction
+        """Scroll-wheel zoom for both 2-D and 3-D axes."""
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            self._store_3d_view_state()
+            return
+
+        # ── 3-D axes: scale all three limits around their centre ──────────────
+        for ax in self.figure.get_axes():
+            if not hasattr(ax, 'zaxis'):
+                continue
+            factor = 0.85 if delta > 0 else 1.18   # zoom-in / zoom-out
+            for get_lim, set_lim in [
+                (ax.get_xlim, ax.set_xlim),
+                (ax.get_ylim, ax.set_ylim),
+                (ax.get_zlim, ax.set_zlim),
+            ]:
+                lo, hi = get_lim()
+                mid  = (lo + hi) / 2
+                half = (hi - lo) / 2 * factor
+                set_lim(mid - half, mid + half)
+            self.draw_idle()
+            self._store_3d_view_state()
+            return
+
+        # ── 2-D axes: zoom around cursor position ─────────────────────────────
+        factor = 0.80 if delta > 0 else 1.25
+        fx = event.x() / max(self.width(),  1)
+        fy = 1.0 - event.y() / max(self.height(), 1)
+
+        zoomed = False
+        for ax in self.figure.get_axes():
+            if hasattr(ax, 'zaxis'):
+                continue
+            bb = ax.get_position()
+            if not (bb.x0 <= fx <= bb.x1 and bb.y0 <= fy <= bb.y1):
+                continue
+            ax_x = (fx - bb.x0) / max(bb.width,  1e-9)
+            ax_y = (fy - bb.y0) / max(bb.height, 1e-9)
+            xlo, xhi = ax.get_xlim()
+            ylo, yhi = ax.get_ylim()
+            mx = xlo + ax_x * (xhi - xlo)
+            my = ylo + ax_y * (yhi - ylo)
+            ax.set_xlim(mx + (xlo - mx) * factor, mx + (xhi - mx) * factor)
+            ax.set_ylim(my + (ylo - my) * factor, my + (yhi - my) * factor)
+            zoomed = True
+
+        if zoomed:
+            self.draw_idle()
+        else:
+            super().wheelEvent(event)
+
         self._store_3d_view_state()
 
-def make_canvas(plot_fn, ctx, figsize=(8, 6), projection=None):
+    def save_image(self, parent=None):
+        """Open a save-file dialog and export the figure."""
+        path, _ = QFileDialog.getSaveFileName(
+            parent, "Save Plot", "calcsx_plot.png",
+            "PNG image (*.png);;PDF (*.pdf);;SVG (*.svg)",
+        )
+        if path:
+            self.figure.savefig(path, dpi=150, bbox_inches='tight',
+                                facecolor=self.figure.get_facecolor())
+
+    def set_grid(self, on: bool):
+        """Show or hide grid on all axes (2-D and 3-D)."""
+        for ax in self.figure.get_axes():
+            ax.grid(on)
+        self.draw_idle()
+
+    def reset_zoom(self):
+        """Autoscale all axes back to data extents."""
+        for ax in self.figure.get_axes():
+            ax.autoscale()
+        self.draw_idle()
+
+
+# ─────────────────────────────────────────────────────────────
+# Thin toolbar that wraps any WatermarkedCanvas
+# ─────────────────────────────────────────────────────────────
+
+class PlotToolbar(QWidget):
     """
-    Returns a WatermarkedCanvas, which will draw the watermark in the Qt layer, not in Matplotlib.
+    A slim button bar to attach below (or above) any WatermarkedCanvas.
+    Provides: Reset Zoom | Grid on/off | Save Image
     """
-    
-    fig = plt.figure(figsize=figsize)
+
+    _BTN_STYLE = (
+        f"QPushButton {{"
+        f"  background:{THEME['panel']}; border:1px solid {THEME['border']};"
+        f"  border-radius:3px; padding:2px 8px; color:{THEME['text_dim']};"
+        f"  font-size:8pt;"
+        f"}}"
+        f"QPushButton:hover {{"
+        f"  background:{THEME['input']}; border-color:{THEME['accent']};"
+        f"  color:{THEME['text']};"
+        f"}}"
+        f"QPushButton:checked {{"
+        f"  background:{THEME['hi_blue']}; color:{THEME['text']};"
+        f"  border-color:{THEME['accent']};"
+        f"}}"
+    )
+
+    def __init__(self, canvas: 'WatermarkedCanvas', parent=None):
+        super().__init__(parent)
+        self._canvas = canvas
+        has_3d = any(hasattr(ax, 'zaxis') for ax in canvas.figure.get_axes())
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(4)
+        lay.addStretch()
+
+        # Zoom reset only meaningful on 2-D axes (3-D uses orbital drag)
+        if not has_3d:
+            btn_zoom = QPushButton("⌖ Reset Zoom")
+            btn_zoom.setStyleSheet(self._BTN_STYLE)
+            btn_zoom.clicked.connect(canvas.reset_zoom)
+            lay.addWidget(btn_zoom)
+
+        self._btn_grid = QPushButton("⊞ Grid")
+        self._btn_grid.setCheckable(True)
+        self._btn_grid.setChecked(True)
+        self._btn_grid.setStyleSheet(self._BTN_STYLE)
+        self._btn_grid.toggled.connect(canvas.set_grid)
+        lay.addWidget(self._btn_grid)
+
+        btn_save = QPushButton("💾 Save")
+        btn_save.setStyleSheet(self._BTN_STYLE)
+        btn_save.clicked.connect(lambda: canvas.save_image(self))
+        lay.addWidget(btn_save)
+
+
+
+# ─────────────────────────────────────────────────────────────
+# View-switcher bar  (replaces QTabWidget in ResultsPage)
+# ─────────────────────────────────────────────────────────────
+
+class ViewSwitcherBar(QWidget):
+    """
+    Horizontal flat-tab / segmented-control bar for switching named views.
+    Active button: THEME['bg'] background + THEME['accent'] 2 px bottom border.
+    Inactive button: THEME['panel'] background, dim text, hover lightens.
+    Emits view_changed(int) when the active view changes.
+    """
+    view_changed = pyqtSignal(int)
+
+    def __init__(self, labels: list, parent=None):
+        super().__init__(parent)
+        self._buttons: list = []
+        self.setFixedHeight(36)
+        self.setStyleSheet(f"background:{THEME['panel']};")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        for i, label in enumerate(labels):
+            btn = QPushButton(label)
+            btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
+            btn.setFixedHeight(36)
+            btn.clicked.connect(lambda _, idx=i: self._activate(idx))
+            self._buttons.append(btn)
+            lay.addWidget(btn)
+
+        lay.addStretch(1)
+
+        if self._buttons:
+            self._activate(0)
+
+    def _activate(self, idx: int):
+        for i, btn in enumerate(self._buttons):
+            if i == idx:
+                btn.setStyleSheet(
+                    f"QPushButton {{"
+                    f" background:{THEME['bg']};"
+                    f" color:{THEME['text']};"
+                    f" border:none;"
+                    f" border-bottom:2px solid {THEME['accent']};"
+                    f" padding:0 20px;"
+                    f" font-size:9pt;"
+                    f" font-weight:600;"
+                    f"}}"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{"
+                    f" background:{THEME['panel']};"
+                    f" color:{THEME['text_dim']};"
+                    f" border:none;"
+                    f" border-bottom:2px solid transparent;"
+                    f" padding:0 20px;"
+                    f" font-size:9pt;"
+                    f"}}"
+                    f"QPushButton:hover {{"
+                    f" color:{THEME['text']};"
+                    f" background:{THEME['input']};"
+                    f"}}"
+                )
+        self.view_changed.emit(idx)
+
+    def activate(self, idx: int):
+        """Programmatically switch to view idx without re-emitting if already active."""
+        self._activate(idx)
+
+
+def make_canvas_with_toolbar(plot_fn, ctx, figsize=(8, 6),
+                              projection=None) -> QWidget:
+    """
+    Returns a QWidget containing a WatermarkedCanvas above a PlotToolbar.
+    Drop-in replacement for make_canvas() when toolbar controls are desired.
+    """
+    canvas = make_canvas(plot_fn, ctx, figsize=figsize, projection=projection)
+    wrapper = QWidget()
+    lay = QVBoxLayout(wrapper)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+    lay.addWidget(canvas, stretch=1)
+    lay.addWidget(PlotToolbar(canvas))
+    return wrapper
+
+
+def make_canvas(plot_fn, ctx, figsize=(8, 6), projection=None) -> WatermarkedCanvas:
+    """Create a WatermarkedCanvas with the dark background already applied."""
+    fig = plt.figure(figsize=figsize, facecolor=THEME['bg'])
     if projection:
         ax = fig.add_subplot(111, projection=projection)
     else:
         ax = fig.add_subplot(111)
-
     plot_fn(ax, ctx)
-
     plt.close(fig)
-    # wrap it in our canvas subclass
     canvas = WatermarkedCanvas(fig)
-    
-    # Store initial state right after plot creation
     canvas._store_3d_view_state()
-    
     return canvas
 
+
+# ─────────────────────────────────────────────────────────────
+# Logo mixin (kept for backward compat; now also used by ParameterPanel)
+# ─────────────────────────────────────────────────────────────
+
 class LogoMixin:
-    
     def __init__(self, logo_path, logo_pct=0.2, margin=10):
         self._logo_path = logo_path
-        self._logo_pct = logo_pct
-        self._margin = margin
-    
+        self._logo_pct  = logo_pct
+        self._margin    = margin
+
     def paint_logo(self, painter, widget):
         pix = QPixmap(self._logo_path)
-        if pix.isNull(): 
+        if pix.isNull():
             return
         tw = int(widget.width() * self._logo_pct)
         scaled = pix.scaledToWidth(tw, Qt.SmoothTransformation)
-        x = self._margin
-        y = self._margin
-        painter.drawPixmap(x, y, scaled)
+        painter.drawPixmap(self._margin, self._margin, scaled)
+
+
+# ─────────────────────────────────────────────────────────────
+# Progress reporter
+# ─────────────────────────────────────────────────────────────
 
 class ProgressReporter(QObject):
     """
-    Dynamic loading screen with quippy cycling messages and a stage subtitle
-    that reflects the actual computation step in progress.
+    Dynamic loading screen: quippy cycling messages + computation-stage subtitle.
     """
 
     DEFAULT_MESSAGES = [
-        "Crunching numbers", "Smoothing splines", "Aligning magnetic fields",
-        "Doing the math", "Winding HTS", "Acting busy", "Spinning the gimbal",
-        "Charging capacitors", "Calculating Lorentz forces", "Applying stress model",
-        "Dividing by zero", "Working overtime", "Thinking very hard",
-        "Vectorizing field equations", "Batching the Biot-Savart",
-        "Querying the matrix", "Racing electrons", "Consulting Maxwell",
-        "Solving in parallel", "Flipping the parity", "Inverting the Jacobian",
-        "Aligning flux quanta", "Cooling the coil", "Integrating by parts",
+        "Crunching numbers",       "Smoothing splines",        "Aligning magnetic fields",
+        "Doing the math",          "Winding HTS",              "Acting busy",
+        "Spinning the gimbal",     "Charging capacitors",      "Calculating Lorentz forces",
+        "Applying stress model",   "Dividing by zero",         "Working overtime",
+        "Thinking very hard",      "Vectorizing field equations", "Batching the Biot-Savart",
+        "Querying the matrix",     "Racing electrons",         "Consulting Maxwell",
+        "Solving in parallel",     "Flipping the parity",      "Inverting the Jacobian",
+        "Aligning flux quanta",    "Cooling the coil",         "Integrating by parts",
+        "Commuting the operators", "Calibrating the torus",
     ]
 
     def __init__(self, parent=None, title=""):
@@ -172,33 +566,27 @@ class ProgressReporter(QObject):
         self.dlg.setAutoReset(False)
         self.dlg.setAutoClose(False)
         self.dlg.setCancelButton(None)
+        self.dlg.setMinimumWidth(360)
 
-        # Enable rich text on the inner label so HTML renders correctly
         label = self.dlg.findChild(QLabel)
         if label:
             label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
             label.setTextFormat(Qt.RichText)
+            label.setMinimumHeight(52)
 
-        # state
-        self._msgs         = []
-        self._base_message = "Booting up"
-        self._stage_text   = ""          # current computation stage (subtitle)
-        self._dot_cycle    = ["", ".", "..", "..."]
-        self._dot_index    = 0
+        self._msgs          = []
+        self._base_message  = "Booting up"
+        self._stage_text    = ""
+        self._dot_cycle     = ["", ".", "..", "..."]
+        self._dot_index     = 0
+        self._count         = 0
+        self._interval      = 0
+        self._booting       = True
+        self._last_msg_time = 0.0
+        self._min_msg_sec   = 4.0
 
-        # progress-driven switching
-        self._count    = 0
-        self._interval = 0
-        self._booting  = True
-
-        # timing to prevent too-frequent message switches
-        self._last_msg_time  = 0.0
-        self._min_msg_seconds = 4.0
-
-        # timers
-        self._dot_timer = QTimer(self)
+        self._dot_timer  = QTimer(self)
         self._dot_timer.timeout.connect(self._advance_dots)
-
         self._boot_timer = QTimer(self)
         self._boot_timer.setSingleShot(True)
         self._boot_timer.timeout.connect(self._end_boot)
@@ -210,37 +598,30 @@ class ProgressReporter(QObject):
         self._stage_text   = ""
         self._dot_index    = 0
         self._booting      = True
-
         self.dlg.setValue(0)
         self._update_label()
         self.dlg.show()
         QApplication.processEvents()
-
-        self._dot_timer.start(700)       # dot animation every 700 ms
-        self._boot_timer.start(1800)     # boot phase lasts 1.8 s
-
-        self._interval       = random.randint(12, 20)
-        self._count          = 0
-        self._last_msg_time  = time.time()
+        self._dot_timer.start(700)
+        self._boot_timer.start(1800)
+        self._interval      = random.randint(12, 20)
+        self._count         = 0
+        self._last_msg_time = time.time()
 
     def report(self, pct: int):
-        """Update progress bar; may cycle to the next quippy message."""
         self.dlg.setValue(pct)
-
         if not self._booting:
             self._count += 1
             now = time.time()
-            if (self._count >= self._interval and
-                    (now - self._last_msg_time) >= self._min_msg_seconds):
+            if self._count >= self._interval and (now - self._last_msg_time) >= self._min_msg_sec:
                 self._next_message()
-                self._count    = 0
-                self._interval = random.randint(12, 20)
+                self._count         = 0
+                self._interval      = random.randint(12, 20)
                 self._last_msg_time = now
-
         QApplication.processEvents()
 
     def set_stage(self, msg: str):
-        """Show the current computation stage as a subtitle (called from worker thread via signal)."""
+        """Update computation-stage subtitle (called via cross-thread signal)."""
         self._stage_text = msg
         self._update_label()
 
@@ -254,7 +635,7 @@ class ProgressReporter(QObject):
         self._update_label()
         QTimer.singleShot(600, self.dlg.close)
 
-    # ---- internal helpers ----
+    # ── internal ──────────────────────────────────────────────
 
     def _end_boot(self):
         self._booting = False
@@ -262,32 +643,27 @@ class ProgressReporter(QObject):
         self._last_msg_time = time.time()
 
     def _next_message(self):
-        if self._msgs:
-            self._base_message = self._msgs.pop()
-        else:
-            # Replenish and reshuffle when exhausted
+        if not self._msgs:
             self._msgs = list(self.DEFAULT_MESSAGES)
             random.shuffle(self._msgs)
-            self._base_message = self._msgs.pop()
+        self._base_message = self._msgs.pop()
         self._update_label()
 
     def _update_label(self):
-        dots = self._dot_cycle[self._dot_index]
-        base = self._base_message.rstrip('.')
-        # Reserve horizontal space for up to 3 dots using non-breaking spaces
+        dots    = self._dot_cycle[self._dot_index]
+        base    = self._base_message.rstrip('.')
         padding = '&nbsp;' * (3 - len(dots))
         quippy  = f"{base}{dots}{padding}"
-
         if self._stage_text:
             html = (
-                f'<div style="text-align:center; line-height:1.5">'
+                f'<div style="text-align:center;line-height:1.6">'
                 f'{quippy}<br>'
-                f'<span style="font-size:85%; color:#888">{self._stage_text}</span>'
+                f'<span style="font-size:85%;color:{THEME["text_dim"]}">'
+                f'{self._stage_text}</span>'
                 f'</div>'
             )
         else:
             html = f'<div style="text-align:center">{quippy}</div>'
-
         self.dlg.setLabelText(html)
 
     def _advance_dots(self):

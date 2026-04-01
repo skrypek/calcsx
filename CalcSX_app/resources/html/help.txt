@@ -30,6 +30,14 @@
 
   <h3>What's New!</h3>
   <ul>
+    <li><b>v1.2.0</b> — UI overhaul &amp; B-field slice viewer</li>
+    <ul>
+      <li><b>Two-panel workbench layout</b>: parameters always visible on the left; results fill the right panel — no more page-switching</li>
+      <li><b>Scalar summary dashboard</b>: compact metrics bar (B centroid, peak on-axis |B|, peak force density, peak hoop stress, arc length) appears above results after every Generate</li>
+      <li><b>B-Field Slice Viewer tab</b>: interactive 3-D planar slicer — scrub a cross-sectional |B| plane along the PCA axis. PyVista (VTK) rendering when available; matplotlib 3-D surface fallback otherwise</li>
+      <li><b>Dark theme</b>: VS-Code-inspired dark palette applied to all widgets, plots, and colour bars</li>
+      <li><b>Terminal monospace font</b>: JetBrains Mono / Cascadia Code / Fira Code (best available) used throughout the UI and all plots</li>
+    </ul>
     <li><b>v1.1.0</b> — Performance &amp; usability overhaul</li>
     <ul>
       <li><b>Vectorized Biot-Savart engine</b>: all field evaluations now use fully NumPy-vectorized kernels — no Python loops over segments. Typical speedup: 10–50× for force integration, 100×+ for B-field cross-section</li>
