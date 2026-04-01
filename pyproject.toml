@@ -4,22 +4,25 @@ build-backend = "briefcase.backend"
 
 [tool.briefcase]
 project_name = "CalcSX_app"
-version      = "1.1.0"
-bundle       = "com.askrypek.calcsx"
-support_package = "calcsx-env.tar.gz"
+version      = "2.0.0"
+bundle       = "sx.calc.calcsx"
 
 [tool.briefcase.app.CalcSX_app]
 formal_name   = "CalcSX"
 description   = "A magnetostatics simulation"
 author        = "Alexander Skrypek"
 author_email  = "as7168@columbia.edu"
+url           = "https://calc.sx"
 license       = "MIT"
 requires = [
   "numpy",
+  "scipy",
   "pandas",
   "matplotlib",
   "PyQt5",
-  "mplcursors"
+  "mplcursors",
+  "pyvista",
+  "pyvistaqt"
 ]
 
 # Only your inner package

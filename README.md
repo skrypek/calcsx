@@ -1,34 +1,62 @@
 # CalcSX™
 ### A Magnetostatics Simulation
-**Version:** 1.1.0 &nbsp;|&nbsp; **Author:** Alexander Skrypek &nbsp;|&nbsp; **License:** MIT
+**Version:** 2.0.0 &nbsp;|&nbsp; **Author:** Alexander Skrypek &nbsp;|&nbsp; **License:** MIT
 
-Developed with assistance from the Columbia Fusion Research Center (CFRC).
+Developed with experimental validation assistance from the Columbia Fusion Research Center (CFRC).
 
 ---
 
 ## Overview
 
-CalcSX™ is a desktop GUI application for simulating and analyzing the electromagnetic and mechanical behavior of superconducting coils. Given a coil geometry defined as a 3D coordinate path, CalcSX™ computes:
+CalcSX™ is a desktop GUI for simulating and analyzing the electromagnetic and mechanical behavior of superconducting coils. Given a coil geometry (CSV of 3D coordinates), CalcSX™ computes:
 
 - **B-field** magnitude at the coil centroid and along the axis of symmetry
-- **Lorentz force density** vectors at each coil segment (J×B)
+- **Lorentz force density** vectors at each segment (J×B)
 - **Hoop stress** via membrane decomposition
-- **B-field cross-section** heat map on the centroid plane (optional)
+- **3-D magnetic field lines** traced via batched RK4 integration
+- **Cross-sectional B-field maps** — interactive 2D heatmap sliced through any plane along the axis of symmetry
 
-The coil geometry is analyzed using Principal Component Analysis (PCA) to automatically determine the axis of symmetry and detect planar coil configurations.
+The coil geometry is analyzed with PCA to determine the axis of symmetry automatically.
 
 ---
 
-## What's New in v1.1.0
+## Version 2.0.0 has arrived!
+
+### INSPECT Tools — Field Visualization Overhaul
 
 | Change | Detail |
 |---|---|
-| **Vectorized Biot-Savart** | Core field kernel fully NumPy-vectorized — no Python loops over segments. Typical speedup: 10–50× for force integration, 100×+ for cross-section sampling |
-| **Chunked cross-section** | Large grids computed in 500-point memory-safe batches; no RAM spikes at high resolution |
-| **Adaptive grid resolution** | Cross-section grid size is user-configurable (32–512 pts/axis); no longer fixed at 120 |
-| **Configurable on-axis samples** | On-axis B-field profile sample count configurable (50–1000 pts) |
-| **Save Results** | Export arc data (force density, hoop stress) and on-axis B-field to CSV directly from the results view |
-| **Stage-aware loading screen** | Progress dialog shows the active computation step alongside quippy messages |
+| **Magnetic field line tracing** | 3-D streamlines seeded on a Fibonacci sphere around the coil, integrated forward and backward via batched RK4 |
+| **Slidable cross-section plane** | 2-D B-field heatmap sliced perpendicular to the PCA symmetry axis; position adjustable via "Section Pos. (m)" spinbox in the Properties panel |
+| **log₁₀ colormap scaling** | Dynamic range compression for both INSPECT layers — near-coil strong-field and far-field weak-field are simultaneously readable |
+| **Independent scalar bars** | Each INSPECT layer carries its own legend; visibility follows the browser eye-icon toggle |
+| **Non-interfering layers** | Field Lines and Cross Section coexist — running one does not clear the other |
+
+### Workspace and UI
+
+| Change | Detail |
+|---|---|
+| **Removed B-Field Volume** | Legacy feature was never pushed and ultimately scrapped in favor of more practical visualization tools |
+
+### Physics Core
+
+| Change | Detail |
+|---|---|
+| **Batched RK4 field-line integrator** | All active seed lines advanced simultaneously in NumPy — no Python loop over individual lines |
+| **Chunked midplane evaluation** | Cross-section B-field computed in 2 000-point chunks for memory efficiency |
+| **Fibonacci sphere seeding** | Uniform seed distribution on the unit sphere; configurable seed count (8–60) in the Properties panel |
+
+---
+
+## Version History
+
+| Version | Highlights |
+|---|---|
+| **2.0.0** | INSPECT tools introduced; UI adjustments |
+| 1.3.0 | Full PyVista/VTK 3-D backend; Fusion 360 workbench (ribbon, layer browser, properties panel); B-field volume (GPU + point-cloud); normalize-forces toggle |
+| 1.2.0 | Major UI overhaul: two-panel workbench, dark theme throughout; B-field slice viewer |
+| 1.1.0 | Vectorized Biot-Savart kernel (10–50× speedup); chunked cross-section; Save Results |
+| 1.0.0 | Initial release: CSV loading, Biot-Savart, PyQt5 GUI, force/stress/axis plots |
 
 ---
 
@@ -36,14 +64,16 @@ The coil geometry is analyzed using Principal Component Analysis (PCA) to automa
 
 | Feature | Description |
 |---|---|
-| Filament Visualization | 3D parametric plot of coil geometry with PCA axis and direction of parametrization |
-| B-Field Analysis | On-axis magnitude profile (configurable sample count) and optional on-plane heat map |
-| Lorentz Force Density | Segment-wise J×B vector field with viridis colormap |
-| Hoop Stress | Arc-length-resolved membrane hoop stress (MPa) |
-| Integration Methods | Simpson's Rule (default) or Gaussian Quadrature (higher accuracy) |
-| Interactive Plots | Hover cursor on all 2D plots for precise numerical readout |
-| Planar Coil Support | Automatic planar detection with adapted force/stress algorithms (beta) |
-| Result Export | Save computed arrays to CSV for downstream analysis |
+| Coil Visualization | GPU-rendered smooth spline wire over a floor-grid reference plane |
+| Lorentz Force Layer | Per-segment J×B arrow glyphs, plasma-coloured by magnitude; normalizable |
+| Hoop Stress Layer | Midpoint point cloud coloured by hoop stress (MPa, YlOrRd) |
+| On-Axis B-Field Layer | Point cloud along the PCA axis coloured by \|B\| (cool cmap) |
+| Field Lines (INSPECT) | 3-D magnetic streamlines, batched RK4, log₁₀\|B\| coloured (cool) |
+| Cross Section (INSPECT) | 2-D B-field heatmap in any plane along the axis; slidable offset |
+| Layer Browser | Eye-icon toggles per layer and per group; legend visibility follows |
+| Ribbon Toolbar | SIMULATION / INSPECT / CONSTRUCT / UTILITIES tabs |
+| Integration Methods | Vectorized Biot-Savart; optional Gaussian Quadrature |
+| Dark Theme | VS-Code-inspired palette throughout UI |
 
 ---
 
@@ -57,27 +87,32 @@ Python **3.9** or later is recommended.
 | Library | Purpose |
 |---|---|
 | `numpy` | Numerical arrays, vectorized Biot-Savart kernel |
-| `pandas` | CSV loading, data handling, result export |
-| `matplotlib` | All plotting (2D and 3D) |
+| `scipy` | Scientific utilities |
+| `pandas` | CSV loading and data handling |
+| `matplotlib` | 2-D legacy plots |
 | `PyQt5` | GUI framework |
 | `mplcursors` | Interactive hover cursors on 2D plots |
 | `scikit-learn` | PCA for coil axis detection |
+| `pyvista` | 3-D mesh/volume data structures (VTK wrapper) |
+| `pyvistaqt` | PyVista Qt-embedded interactor widget |
 
-Install all dependencies at once:
+Install all dependencies:
 
 ```bash
-pip install numpy pandas matplotlib PyQt5 mplcursors scikit-learn
+pip install numpy scipy pandas matplotlib PyQt5 mplcursors scikit-learn pyvista pyvistaqt
 ```
 
-Or with a virtual environment (recommended):
+With a virtual environment (recommended):
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate       # macOS/Linux
+source .venv/bin/activate       # macOS / Linux
 .venv\Scripts\activate          # Windows
 
-pip install numpy pandas matplotlib PyQt5 mplcursors scikit-learn
+pip install numpy scipy pandas matplotlib PyQt5 mplcursors scikit-learn pyvista pyvistaqt
 ```
+
+> **Note — Apple Silicon (M1/M2/M3):** VTK is available via pip on arm64 since VTK 9.2. If `pip install pyvista pyvistaqt` fails, try `conda install -c conda-forge pyvista pyvistaqt`.
 
 ---
 
@@ -85,7 +120,7 @@ pip install numpy pandas matplotlib PyQt5 mplcursors scikit-learn
 
 ### 1. Prepare Your Coil CSV
 
-The input CSV must contain the 3D coordinates of the coil centerline. Columns should be labeled `x`, `y`, `z` (case-sensitive). If no headers are present, the first three columns are used.
+The input CSV must contain the 3-D coordinates of the coil centerline with columns `x`, `y`, `z` (case-sensitive). If no headers are present, the first three columns are used.
 
 ```
 x,y,z
@@ -94,7 +129,7 @@ x,y,z
 ...
 ```
 
-The curve does **not** need to be manually closed — CalcSX™ will close open loops automatically.
+The curve does **not** need to be manually closed — CalcSX™ closes open loops automatically.
 
 ### 2. Run the Application
 
@@ -102,55 +137,58 @@ The curve does **not** need to be manually closed — CalcSX™ will close open 
 python -m CalcSX_app.main
 ```
 
-Or, if running from inside the `CalcSX_app` directory:
-
-```bash
-python main.py
-```
-
 ### 3. Workflow
 
-1. Click **Load CSV...** and select your coil geometry file.
-2. Click **Preview Curve** to inspect the 3D coil shape.
-3. Set coil parameters:
-   - **Number of Winds** — total winding count
-   - **Current (A)** — operating current
-   - **Tape Thickness (µm)** — per-layer tape thickness (default: 80 µm, standard ReBCO)
-   - **Tape Width (mm)** — tape width (default: 4.00 mm)
-   - **On-Axis Samples** — number of points on the B-field profile (default: 200)
-4. *(Optional)* Check **Calculate B-Field Cross-section** to compute a heat map on the centroid plane.
-   - Set the **max |B|** filter threshold for display fidelity.
-   - Set the **Cross-section Grid** resolution (32–512 pts/axis; higher = more detail, slower).
-5. *(Optional)* Check **Use Gaussian Quadrature** for higher-accuracy force integration (not recommended for coils with more than ~300 points).
-6. Click **Generate** to run the full analysis.
-7. On the results page, click **Save Results…** to export computed arrays to CSV.
+The interface uses a **Fusion 360-style workbench**: ribbon at top, layer browser + properties on the left, 3-D viewport filling the rest.
+
+1. Click **▲ Load CSV** in the ribbon FILE group — the coil wire appears in the viewport and "Coil" is added to the browser under **Coils**.
+2. Set coil parameters in the Properties panel (winds, current, tape dimensions, etc.).
+3. Click **▶ Run Analysis** — Forces, Stress, and B Axis layers appear; results summary populates.
+4. Switch to the **INSPECT** tab in the ribbon:
+   - **∿ Field Lines** — traces 3-D magnetic field lines (set seed count in Properties).
+   - **⊡ Cross Section** — renders a 2-D B-field heatmap; use "Section Pos. (m)" to slide the plane along the symmetry axis.
+5. Toggle any layer using the eye icons (●/○) in the browser panel; legends hide/show with their layer.
+
+### 3-D Navigation
+
+| Action | Result |
+|---|---|
+| Left-click drag | Orbital rotate (Z-axis locked — ground stays fixed) |
+| Right-click drag | Zoom |
+| Scroll wheel | Zoom |
+| Middle-click drag | Pan |
+| **⌖ Reset View** button | Fit all to camera |
 
 ---
 
-## Output Plots
+## Future Directions
 
-After generation, CalcSX™ displays the following in a tabbed results view:
+The following capabilities are planned for future versions of CalcSX™:
 
-- **Filament Curve** — 3D plot with PCA axis, in-plane basis vectors, and parametrization direction
-- **Lorentz Force Density Vectors** — 3D quiver plot colored by magnitude (N/m); toggle normalized arrows via checkbox
-- **Force Density vs Arc Length** — 2D line plot with interactive cursor
-- **Hoop Stress vs Arc Length** — 2D line plot with interactive cursor (MPa)
-- **|B| vs Axis Distance** — On-axis B-field profile with interactive cursor
-- **|B| Cross-Section** *(if enabled)* — Log-scale heat map of field magnitude on the centroid plane
+### High Priority
+- **GPU acceleration** — offload the Biot-Savart kernel to CUDA/Metal via CuPy or PyTorch so that large coil geometries (>10 000 segments) and fine field-line integration become interactive-speed.
+- **Real conductor cross-sections** — replace the filamentary wire model with a finite cross-section discretization (e.g., a stack of ReBCO tapes or a cable bundle); compute B and force distributions within the winding pack rather than just at the centerline.
 
----
+### Physics Extensions
+- **Quench simulation** — thermal runaway model propagating through the winding pack; track normal-zone growth, hot-spot temperature, and energy dump into a protection circuit. Visualize the propagating quench front in the 3-D viewport.
+- **Field line topology tools** — Poincaré section maps, separatrix detection, and field-line connection-length plots for confinement analysis.
+- **Multi-coil superposition** — load multiple CSVs and sum their B-fields; layer browser groups each coil independently; useful for solenoid pairs, Helmholtz coils, and tokamak PF-coil sets.
 
-## Notes
+### Design and CAD
+- **In-app coil prototyping** — parametric coil geometry builder (solenoid, saddle, helical, pancake) with real-time preview; export to CSV or STEP for manufacturing.
+- **Click-to-inspect** — click any point on the coil wire to query local B, J×B, and stress; scroll the sidebar to the corresponding layer.
+- **Undo / redo** — full action stack so CSV reloads and analysis re-runs can be stepped back.
 
-- The **?** button in the top-right corner of the main window opens the in-app help dialog.
-- Zooming is not currently supported on any generated plot.
-- 3D plots support left-drag rotation.
-- Planar coil detection is available but considered **beta** — axis scaling on plots may appear non-intuitive for near-constant fields.
+### Output and Integration
+- **VTK / ParaView export** — save computed field volumes and surface meshes for downstream post-processing.
+- **2-D detail panels** — floating windows per layer with arc-length plots (force vs arc, stress vs arc, on-axis B-field profile).
+- **Persistent settings** — save last-used coil parameters, seed count, and section offset to a JSON config file.
+- **Briefcase packaging** — signed, distributable macOS and Windows app bundles.
 
 ---
 
 ## License
 
-MIT License. © 2025 Alexander Skrypek. CalcSX™ is a pending trademark of Alexander Skrypek.
+MIT License. © 2026 Alexander Skrypek. CalcSX™ is a pending trademark of Alexander Skrypek.
 
 For support: as7168@columbia.edu
