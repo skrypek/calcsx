@@ -15,6 +15,9 @@
   hr { border: none; border-top: 1px solid #ccc; margin: 1.2em 0; }
   .small { font-size: 10pt; color: #555; }
   b { font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; margin: .6em 0 1em; font-size: 11pt; }
+  th { text-align: left; padding: 4px 10px; border-bottom: 2px solid #ccc; font-weight: 600; }
+  td { padding: 3px 10px; border-bottom: 1px solid #e0e0e0; }
 </style>
 </head>
 <body>
@@ -23,88 +26,107 @@
   <p>
     <b>Version:</b> v$VERSION<br>
     <b>Author:</b> Alexander Skrypek<br>
+    <b>Website:</b> <a href="https://calc.sx">calc.sx</a><br>
     <b>Copyright:</b> © 2025 Alexander Skrypek.<br>
     <b>Trademark:</b> CalcSX™ (trademark pending).
   </p>
   <hr>
 
-  <h3>What's New!</h3>
+  <h3>What's New in v2.0.0</h3>
+
+  <b>INSPECT Tools — Field Visualization Overhaul</b>
   <ul>
-    <li><b>v1.2.0</b> — UI overhaul &amp; B-field slice viewer</li>
-    <ul>
-      <li><b>Two-panel workbench layout</b>: parameters always visible on the left; results fill the right panel — no more page-switching</li>
-      <li><b>Scalar summary dashboard</b>: compact metrics bar (B centroid, peak on-axis |B|, peak force density, peak hoop stress, arc length) appears above results after every Generate</li>
-      <li><b>B-Field Slice Viewer tab</b>: interactive 3-D planar slicer — scrub a cross-sectional |B| plane along the PCA axis. PyVista (VTK) rendering when available; matplotlib 3-D surface fallback otherwise</li>
-      <li><b>Dark theme</b>: VS-Code-inspired dark palette applied to all widgets, plots, and colour bars</li>
-      <li><b>Terminal monospace font</b>: JetBrains Mono / Cascadia Code / Fira Code (best available) used throughout the UI and all plots</li>
-    </ul>
-    <li><b>v1.1.0</b> — Performance &amp; usability overhaul</li>
-    <ul>
-      <li><b>Vectorized Biot-Savart engine</b>: all field evaluations now use fully NumPy-vectorized kernels — no Python loops over segments. Typical speedup: 10–50× for force integration, 100×+ for B-field cross-section</li>
-      <li><b>Chunked cross-section sampling</b>: large grids computed in memory-safe batches; no RAM spikes for high-resolution runs</li>
-      <li><b>Adaptive cross-section resolution</b>: new <i>Cross-section Grid</i> control (32–512 pts/axis) replaces the fixed 120×120 grid</li>
-      <li><b>Configurable on-axis samples</b>: new <i>On-Axis Samples</i> control (50–1000 pts) for the B-field profile</li>
-      <li><b>Save Results</b>: export arc-position, force density, hoop stress, and on-axis B-field to CSV from the results view</li>
-      <li><b>Stage-aware loading screen</b>: progress dialog now shows the active computation step as a subtitle alongside the quippy messages</li>
-    </ul>
-    <li><b>v1.0.3</b> — functionality and bug fixes</li>
-    <ul>
-      <li>B-field cross section plotting</li>
-      <li>Planar coil capability (beta)</li>
-      <li>Force density calculations</li>
-      <li>CalcSX™ watermark on plots</li>
-    </ul>
+    <li><b>Magnetic field line tracing</b> — 3-D streamlines seeded on a Fibonacci sphere around the coil, integrated forward and backward via batched RK4; coloured by log₁₀|B| (cool colormap)</li>
+    <li><b>Slidable cross-section plane</b> — 2-D B-field heatmap sliced perpendicular to the PCA symmetry axis; position adjustable via "Section Pos. (m)" in the Properties panel</li>
+    <li><b>log₁₀ colormap scaling</b> — dynamic range compression so near-coil strong-field and far-field weak-field are simultaneously readable</li>
+    <li><b>Independent scalar bars</b> — each INSPECT layer carries its own legend; visibility follows the eye-icon toggle in the browser</li>
+    <li><b>Non-interfering layers</b> — Field Lines and Cross Section coexist; running one does not clear the other</li>
   </ul>
+
+  <b>Workspace and UI</b>
+  <ul>
+    <li><b>Terrain camera mode</b> — camera up-axis locked to Z (Fusion 360-style); the coil appears to rotate above a fixed ground plane</li>
+    <li><b>Improved floor grid</b> — higher contrast reference grid sized to 10× the coil diameter</li>
+    <li><b>Zoom lock on normalize toggle</b> — toggling "Normalize Force Vectors" no longer resets the viewport camera</li>
+  </ul>
+
+  <h3>Version History</h3>
+  <table>
+    <tr><th>Version</th><th>Highlights</th></tr>
+    <tr><td><b>2.0.0</b></td><td>INSPECT tools (field lines + slidable cross-section); terrain camera; scalar bar overhaul</td></tr>
+    <tr><td>1.3.0</td><td>Full PyVista/VTK 3-D backend; Fusion 360 workbench (ribbon, layer browser, properties panel); normalize-forces toggle</td></tr>
+    <tr><td>1.2.0</td><td>Two-panel workbench; dark theme throughout; B-field slice viewer; CAD-style 3-D rendering</td></tr>
+    <tr><td>1.1.0</td><td>Vectorized Biot-Savart kernel (10–50× speedup); chunked cross-section; Save Results</td></tr>
+    <tr><td>1.0.0</td><td>Initial release: CSV loading, Biot-Savart, PyQt5 GUI, force/stress/axis plots</td></tr>
+  </table>
+
+  <hr>
 
   <h3>Getting Started</h3>
   <ol>
-    <li><b>Load CSV → Select file</b>: Load a coil geometry, click <b>Preview Curve</b> to visualize the coordinates.</li>
+    <li><b>Prepare your CSV</b> — columns must be labeled <b>x</b>, <b>y</b>, <b>z</b> (case-sensitive). If no headers are present, the first three columns are used. The curve does not need to be manually closed; CalcSX™ closes open loops automatically.</li>
+    <li><b>Run the application</b> — <code>python -m CalcSX_app.main</code> from the repo root.</li>
+    <li>Click <b>▲ Load CSV</b> in the ribbon FILE group — the coil wire appears in the 3-D viewport and "Coil" is added to the browser under <b>Coils</b>.</li>
+    <li>Set coil parameters in the <b>Properties panel</b>:
       <ul>
-      <li>CSV should have x, y, z column headers</li>
+        <li><b>Winds</b> — total winding count</li>
+        <li><b>Current (A)</b> — operating current</li>
+        <li><b>Tape Thick (µm)</b> — per-layer tape thickness (default: 80 µm, standard ReBCO)</li>
+        <li><b>Tape Width (mm)</b> — tape width (default: 4.00 mm)</li>
+        <li><b>Axis Samples</b> — number of on-axis B-field profile points</li>
+        <li><b>Gaussian Quadrature</b> — higher-accuracy force integration (avoid for &gt; ~300 pts)</li>
+        <li><b>Normalize Force Vectors</b> — toggle between magnitude-encoded and uniform-length arrows</li>
       </ul>
-    <li>Enter magnet operating/manufacturing parameters: <b>Winds</b> and <b>Current</b>.</li>
-    <li>Input tape parameters: <b>Thickness</b> and <b>Width</b>—system default is standard ReBCO.</li>
-    <li>Decide on tasks to perform: check <b>Calculate B-Field Cross-section</b> for an additional on-plane calculation.</li>
-    <ul>
-     <li><b>WARNING</b>: computationally expensive</li>
-     <li>System default is full coil Lorentz force density vector, hoop stress calculations, and on-axis B-field (these will be performed and displayed no matter user preference)</li>
-    </ul>
-    <li>Set B-field filter limit (cross section displays only regions under filter for higher fidelity simulation)</li>
-    <li>Decide on computation method: check <b>Gaussian Quadrature</b> to enable higher accuracy force and stress modeling</li>
-    <ul>
-      <li><b>WARNING</b>: computationally expensive, not recommended for large samples (>300 points)</li>
-      <li>System default is Simpson's Rule integration</li>
-    </ul>
-    <li>Click <b>Generate</b> to compute fields, forces, and stresses.</li>
+    </li>
+    <li>Click <b>▶ Run Analysis</b> — Forces, Stress, and B Axis layers appear; results summary populates.</li>
+    <li>Switch to the <b>INSPECT</b> tab in the ribbon:
+      <ul>
+        <li><b>∿ Field Lines</b> — traces 3-D magnetic field lines. Set seed count in the Properties panel (8–60).</li>
+        <li><b>⊡ Cross Section</b> — renders a 2-D B-field heatmap on a plane through the coil. Use <b>Section Pos. (m)</b> to slide the plane along the symmetry axis.</li>
+      </ul>
+    </li>
+    <li>Toggle any layer using the eye icons (●/○) in the browser panel; legends hide and show with their layer.</li>
   </ol>
 
-  <h3>Interaction</h3>
-  <ul>
-    <li><b>3D Plots</b>:</li>
-    <ol>
-      <li><b>Rotate</b>: Left‑drag in the 3D view</li>
-      <li><b>Normalize</b> Lorentz force density allows normalized vectors to be viewed. Simply check the <b>Show normalized vectors</b> box. This toggle preserves viewing angle and can be undone.</li>
-      <li><b>Zooming</b>: Currently <b>NOT</b> a supported feature on any 3D plot generated by CalcSX™.</li>
-    </ol>
-    <li>2D Plots</b>:</li>
-    <ol>
-      <li><b>Cursor</b>: An interactive cursor is available on every 2D plot, enabling precise numerical analysis of the visual data.
-      <li><b>Zooming</b>: Currently <b>NOT</b> a supported feature on any 2D plot generated by CalcSX™.</li>
-  </ol>
-  </ul>
+  <h3>3-D Navigation</h3>
+  <table>
+    <tr><th>Action</th><th>Result</th></tr>
+    <tr><td>Left-click drag</td><td>Orbital rotate (Z-axis locked — ground stays fixed)</td></tr>
+    <tr><td>Right-click drag</td><td>Zoom</td></tr>
+    <tr><td>Scroll wheel</td><td>Zoom</td></tr>
+    <tr><td>Middle-click drag</td><td>Pan</td></tr>
+    <tr><td><b>⌖ Reset View</b> button</td><td>Fit all objects to camera</td></tr>
+  </table>
 
   <h3>Features</h3>
+  <table>
+    <tr><th>Feature</th><th>Description</th></tr>
+    <tr><td><b>Coil Visualization</b></td><td>GPU-rendered smooth spline wire over a floor-grid reference plane</td></tr>
+    <tr><td><b>Lorentz Force Layer</b></td><td>Per-segment J×B arrow glyphs, plasma-coloured by magnitude; normalizable</td></tr>
+    <tr><td><b>Hoop Stress Layer</b></td><td>Midpoint point cloud coloured by hoop stress (MPa, YlOrRd)</td></tr>
+    <tr><td><b>On-Axis B-Field Layer</b></td><td>Point cloud along the PCA axis coloured by |B| (cool cmap)</td></tr>
+    <tr><td><b>Field Lines (INSPECT)</b></td><td>3-D magnetic streamlines, batched RK4, log₁₀|B| coloured</td></tr>
+    <tr><td><b>Cross Section (INSPECT)</b></td><td>2-D B-field heatmap in any plane along the axis; slidable offset</td></tr>
+    <tr><td><b>Layer Browser</b></td><td>Eye-icon toggles per layer and per group; legends follow visibility</td></tr>
+    <tr><td><b>Vectorized Biot-Savart</b></td><td>Fully NumPy-vectorized kernel; optional Gaussian Quadrature</td></tr>
+  </table>
+
+  <h3>Future Directions</h3>
   <ul>
-    <li><b>Filament</b>: Parametric plotting of coil geometries with direction of curve procession, automatic axis of symmetry calculation via principal component analysis
-    <li><b>B‑Field</b>: Magnitude calculations, on-axis B-field figure via principal component analysis, on-plane B-field heat map</li>
-    <li><b>Lorentz Forces</b>: Segment‑wise J×B vector force density calculations utilizing Biot-Savart</li>
-    <li><b>Stress</b>: Hoop stress (via membrane decomposition) approximations</li>
+    <li><b>GPU acceleration</b> — Biot-Savart kernel offloaded to CUDA/Metal for interactive-speed large coils</li>
+    <li><b>Real conductor cross-sections</b> — finite cross-section winding pack (ReBCO tape stacks, cable bundles) with B and force distributions within the pack</li>
+    <li><b>Quench simulation</b> — thermal runaway propagation, hot-spot temperature, energy dump, and animated quench-front visualization</li>
+    <li><b>Multi-coil superposition</b> — load multiple CSVs with summed B-fields; independent browser groups per coil</li>
+    <li><b>In-app coil prototyping</b> — parametric geometry builder (solenoid, saddle, helical, pancake) with real-time 3-D preview</li>
+    <li><b>Field line topology</b> — Poincaré sections, separatrix detection, connection-length plots</li>
+    <li><b>VTK / ParaView export</b> — save field volumes and surface meshes for downstream post-processing</li>
+    <li><b>2-D detail panels</b> — floating arc-length plots (force, stress, on-axis B-field) per layer</li>
   </ul>
 
-  <p>Support: <a href="mailto:support@example.com">as7168@columbia.edu</a></p>
-
+  <hr>
+  <p>Support: <a href="mailto:as7168@columbia.edu">as7168@columbia.edu</a> &nbsp;|&nbsp; <a href="https://calc.sx">calc.sx</a></p>
   <p class="small">
-    Developed with assistance from the Columbia Fusion Research Center (CFRC).  
+    Developed with assistance from the Columbia Fusion Research Center (CFRC).
     All rights reserved by the author. CalcSX™ is a pending trademark of Alexander Skrypek.
   </p>
 </div>
