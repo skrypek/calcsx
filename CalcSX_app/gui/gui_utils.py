@@ -14,27 +14,104 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 # ─────────────────────────────────────────────────────────────
 # Colour palette (single source of truth for all modules)
 # ─────────────────────────────────────────────────────────────
-THEME = {
-    'bg':       '#1e1e1e',   # VS-Code dark — main window / figure background
-    'panel':    '#252526',   # sidebar / plot area background
-    'input':    '#3c3c3c',   # spin-box / text-field background
-    'border':   '#474747',   # separator lines
-    'text':     '#d4d4d4',   # primary text
-    'text_dim': '#808080',   # secondary / disabled text
-    'accent':   '#4dd0e1',   # cyan — coil lines, active borders, highlight
-    'accent2':  '#ce9178',   # warm orange — secondary plot lines
-    'success':  '#4ec9b0',   # teal — "done" states
-    'warning':  '#dcdcaa',   # yellow — warning states
-    'hi_blue':  '#264f78',   # selection highlight
-    'gen_btn':  '#007acc',   # generate button face
+_DARK_THEME = {
+    'bg':            '#1e1e1e',   # VS-Code dark — main window / figure background
+    'panel':         '#252526',   # sidebar / plot area background
+    'input':         '#3c3c3c',   # spin-box / text-field background
+    'border':        '#474747',   # separator lines
+    'text':          '#d4d4d4',   # primary text
+    'text_dim':      '#808080',   # secondary / disabled text
+    'text_disabled': '#4a4a4a',   # disabled button symbol
+    'text_dis_dim':  '#3a3a3a',   # disabled button label
+    'accent':        '#4dd0e1',   # cyan — coil lines, active borders, highlight
+    'accent2':       '#ce9178',   # warm orange — secondary plot lines
+    'success':       '#4ec9b0',   # teal — "done" states
+    'warning':       '#dcdcaa',   # yellow — warning states
+    'hi_blue':       '#264f78',   # selection highlight
+    'gen_btn':       '#007acc',   # generate button face
+    'gen_btn_hover': '#1a8ad4',   # generate button hover
+    'floor':         '#606060',   # 3-D floor grid colour
+    'edge':          '#404040',   # tube mesh edge colour
+    'del_hover':     '#ff6b6b',   # delete button hover
+    'btn_dis_bdr':   '#333333',   # disabled button border
+    'sb_text':       '#ffffff',   # scalar bar text
+    'tool_bg':       'rgba(255,255,255,0.08)',   # tool button background
+    'tool_bg_hover': 'rgba(255,255,255,0.15)',   # tool button hover
+    'cmap_forces':   'plasma',
+    'cmap_stress':   'YlOrRd',
+    'cmap_field':    'cool',
+    'cmap_section':  'inferno',
+    # Layer designation colours (bright for dark bg)
+    'lyr_forces':    '#ce9178',
+    'lyr_stress':    '#e05050',
+    'lyr_baxis':     '#80d8ff',
+    'lyr_fieldlines':'#80ffff',
+    'lyr_xsection':  '#ff9800',
+    # Coil colour cycle
+    'coil_colors':   ['#4dd0e1','#ff6b6b','#ffd93d','#6bcb77','#4d96ff','#c77dff'],
+    'mode':          'dark',
 }
+
+_LIGHT_THEME = {
+    'bg':            '#f5f5f5',   # near-white background
+    'panel':         '#e8e8ec',   # light-gray sidebars
+    'input':         '#ffffff',   # white input fields
+    'border':        '#c0c4cc',   # medium-gray borders
+    'text':          '#1a1a2e',   # near-black text
+    'text_dim':      '#6b7280',   # muted gray text
+    'text_disabled': '#b0b0b0',   # disabled button symbol (light)
+    'text_dis_dim':  '#c8c8c8',   # disabled button label (light)
+    'accent':        '#21918c',   # viridis teal
+    'accent2':       '#5ec962',   # viridis green
+    'success':       '#31a354',   # green
+    'warning':       '#b8860b',   # dark goldenrod
+    'hi_blue':       '#c8ddf0',   # soft blue selection
+    'gen_btn':       '#3b528b',   # viridis indigo
+    'gen_btn_hover': '#4c6aaf',   # viridis indigo hover
+    'floor':         '#b0b0b0',   # light-gray floor grid
+    'edge':          '#c0c0c0',   # tube mesh edge colour (light)
+    'del_hover':     '#e53935',   # delete button hover (light)
+    'btn_dis_bdr':   '#d0d0d0',   # disabled button border (light)
+    'sb_text':       '#1a1a2e',   # scalar bar text (dark on light bg)
+    'tool_bg':       'rgba(0,0,0,0.06)',       # tool button background (light)
+    'tool_bg_hover': 'rgba(0,0,0,0.12)',       # tool button hover (light)
+    'cmap_forces':   'viridis',
+    'cmap_stress':   'YlOrRd',
+    'cmap_field':    'viridis',
+    'cmap_section':  'viridis',
+    # Layer designation colours (muted for light bg)
+    'lyr_forces':    '#8b5e3c',
+    'lyr_stress':    '#b03030',
+    'lyr_baxis':     '#2070a0',
+    'lyr_fieldlines':'#0d7377',
+    'lyr_xsection':  '#c06000',
+    # Coil colour cycle (deeper tones for light bg)
+    'coil_colors':   ['#21918c','#c62828','#f9a825','#2e7d32','#1565c0','#7b1fa2'],
+    'mode':          'light',
+}
+
+# Mutable dict — updated in-place by set_theme() so all importers see changes
+THEME: dict = dict(_DARK_THEME)
+
+_current_theme_name = 'dark'
+
+def set_theme(name: str) -> None:
+    """Switch theme in place.  *name* is 'dark' or 'light'."""
+    global _current_theme_name
+    src = _LIGHT_THEME if name == 'light' else _DARK_THEME
+    THEME.clear()
+    THEME.update(src)
+    _current_theme_name = name
+
+def get_theme_name() -> str:
+    return _current_theme_name
 
 # ─────────────────────────────────────────────────────────────
 # Application-level dark setup helpers
 # ─────────────────────────────────────────────────────────────
 
-def build_dark_palette() -> QPalette:
-    """Return a QPalette matching THEME for use with Fusion style."""
+def build_palette() -> QPalette:
+    """Return a QPalette matching the current THEME for use with Fusion style."""
     p = QPalette()
     bg      = QColor(THEME['bg'])
     panel   = QColor(THEME['panel'])
@@ -62,6 +139,9 @@ def build_dark_palette() -> QPalette:
     p.setColor(QPalette.Disabled, QPalette.ButtonText,  dim)
     p.setColor(QPalette.Disabled, QPalette.WindowText,  dim)
     return p
+
+# Backward-compatible alias
+build_dark_palette = build_palette
 
 
 def pick_mono_font(size: int = 9) -> QFont:
@@ -106,8 +186,9 @@ def apply_mpl_dark_theme() -> None:
     })
 
 
-# Global QSS stylesheet (loaded once from main.py)
-APP_QSS = f"""
+def build_app_qss() -> str:
+    """Generate the global QSS stylesheet from the current THEME."""
+    return f"""
 QWidget {{
     background-color: {THEME['bg']};
     color: {THEME['text']};
@@ -152,13 +233,13 @@ QPushButton {{
 }}
 QPushButton:hover {{ background: {THEME['input']}; border-color: {THEME['accent']}; }}
 QPushButton:pressed {{ background: {THEME['hi_blue']}; }}
-QPushButton:disabled {{ color: {THEME['text_dim']}; border-color: #333; background: {THEME['panel']}; }}
+QPushButton:disabled {{ color: {THEME['text_dim']}; border-color: {THEME['btn_dis_bdr']}; background: {THEME['panel']}; }}
 /* generate button gets accent face */
 QPushButton#GenerateButton {{
-    background: {THEME['gen_btn']}; color: #ffffff;
+    background: {THEME['gen_btn']}; color: {THEME['sb_text']};
     border-color: {THEME['gen_btn']}; font-weight: bold;
 }}
-QPushButton#GenerateButton:hover {{ background: #1a8ad4; }}
+QPushButton#GenerateButton:hover {{ background: {THEME['gen_btn_hover']}; }}
 QPushButton#GenerateButton:disabled {{
     background: {THEME['panel']}; color: {THEME['text_dim']};
     border-color: {THEME['border']};
@@ -213,11 +294,40 @@ QSlider::handle:horizontal {{
 QSlider::sub-page:horizontal {{ background: {THEME['accent']}; border-radius: 2px; }}
 /* ── tool button (help ?) ── */
 QToolButton {{
-    background: rgba(255,255,255,0.08); border: 1px solid {THEME['border']};
+    background: {THEME['tool_bg']}; border: 1px solid {THEME['border']};
     border-radius: 6px; font-weight: bold; color: {THEME['text']};
 }}
-QToolButton:hover {{ background: rgba(255,255,255,0.15); border-color: {THEME['accent']}; }}
+QToolButton:hover {{ background: {THEME['tool_bg_hover']}; border-color: {THEME['accent']}; }}
+/* ── structural helpers (objectName-based, auto-refresh on theme switch) ── */
+QFrame#hdivider {{ color: {THEME['border']}; }}
+QFrame#vbar     {{ color: {THEME['border']}; }}
+QLabel#section_lbl {{ color: {THEME['text_dim']}; font-size: 7pt; letter-spacing: 1.5px; }}
+QLabel#ribbon_grp_lbl {{
+    color: {THEME['text_dim']}; font-size: 7pt;
+    border-top: 1px solid {THEME['border']}; padding-top: 1px;
+}}
+QLabel#dim_label {{ color: {THEME['text_dim']}; font-size: 8pt; }}
+QPushButton#coil_del {{
+    color: {THEME['text_dim']}; font-size: 10pt; border: none;
+    background: transparent; padding: 0;
+}}
+QPushButton#coil_del:hover {{ color: {THEME['del_hover']}; }}
 """
+
+# Pre-build for backward compatibility (importers that use APP_QSS at load time)
+APP_QSS = build_app_qss()
+
+
+def apply_theme_to_app(name: str) -> None:
+    """Switch the live application between 'dark' and 'light' themes."""
+    global APP_QSS
+    set_theme(name)
+    APP_QSS = build_app_qss()
+    app = QApplication.instance()
+    if app is not None:
+        app.setPalette(build_palette())
+        app.setStyleSheet(APP_QSS)
+
 
 # ─────────────────────────────────────────────────────────────
 # Canvas helpers

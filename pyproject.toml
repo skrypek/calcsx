@@ -4,12 +4,12 @@ build-backend = "briefcase.backend"
 
 [tool.briefcase]
 project_name = "CalcSX_app"
-version      = "2.0.0"
+version      = "2.1.0"
 bundle       = "sx.calc.calcsx"
 
 [tool.briefcase.app.CalcSX_app]
 formal_name   = "CalcSX"
-description   = "A magnetostatics simulation"
+description   = "A magnetostatics simulation for superconducting coils"
 author        = "Alexander Skrypek"
 author_email  = "as7168@columbia.edu"
 url           = "https://calc.sx"
@@ -20,7 +20,7 @@ requires = [
   "pandas",
   "matplotlib",
   "PyQt5",
-  "mplcursors",
+  "scikit-learn",
   "pyvista",
   "pyvistaqt"
 ]
@@ -28,7 +28,7 @@ requires = [
 # Only your inner package
 sources       = ["CalcSX_app"]
 
-# Non‑code assets
+# Non-code assets
 resources     = ["CalcSX_app/resources"]
 icon          = "CalcSX_app/resources/images/app"
 

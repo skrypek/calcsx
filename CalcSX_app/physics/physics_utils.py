@@ -3,12 +3,17 @@ import numpy as np
 from sklearn.decomposition import PCA
 
 class CoilAnalysis:
-    def __init__(self, coords, winds, current, thickness_microns, tape_width_mm):
+    def __init__(self, coords, winds, current, thickness_microns, tape_width_mm,
+                 B_ext=None):
         # raw inputs
         self.compute_bfield_enabled = False
         self.coords = coords
         self.winds = winds
         self.current = current
+        # External B-field callback for multi-coil superposition.
+        # Callable[[ndarray], ndarray]: points (M,3) → B (M,3) from other coils.
+        # None means single-coil mode (no external contributions).
+        self._B_ext = B_ext
         # convert units (meters and total thickness)
         self.thickness = thickness_microns * 1e-6 # m per turn
         self.total_thickness = self.thickness * winds # total coil thickness
@@ -37,6 +42,12 @@ class CoilAnalysis:
         self.B_axial = None
         self.use_gauss = False
         self._n_grid = 120   # stored so results_page fallback respects user choice
+        # Volumetric filament grid (populated by _build_filament_grid)
+        self._n_fil       = 1
+        self._fil_coords  = None
+        self._fil_weights = None
+        self._fil_dl      = None
+        self._fil_mid     = None
 
 
     def run_analysis(self, compute_bfield=False, use_gauss=False,
@@ -73,6 +84,10 @@ class CoilAnalysis:
         self._compute_arc()
         if progress_callback:
             progress_callback(20)
+
+        # 2.5) Build volumetric filament grid
+        _stage("Building filament grid")
+        self._build_filament_grid()
 
         # 3) B-field at centroid -> 30%
         _stage("Biot-Savart at centroid")
@@ -171,6 +186,46 @@ class CoilAnalysis:
     # Core vectorized Biot-Savart kernels
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _bfield_from_source(points, source_coords, current, winds,
+                             skip_index=None, core_radius=1e-4):
+        """
+        Stateless vectorized Biot-Savart kernel.
+
+        Parameters
+        ----------
+        points       : (M, 3) observation points (already 2-D)
+        source_coords: (n+1, 3) source path vertices
+        current, winds: scalar electrical parameters
+        skip_index   : int or None — segment to zero out
+        core_radius  : regularisation radius
+
+        Returns (M, 3) B-field array.
+        """
+        I  = float(current)
+        N  = float(winds)
+        a2 = float(core_radius) ** 2
+        if not np.isfinite(a2) or a2 <= 0.0:
+            a2 = 1e-8
+
+        dl  = source_coords[1:] - source_coords[:-1]          # (n, 3)
+        mid = 0.5 * (source_coords[:-1] + source_coords[1:])  # (n, 3)
+
+        r  = points[:, None, :] - mid[None, :, :]             # (M, n, 3)
+        r2 = np.einsum('mni,mni->mn', r, r)                    # (M, n)
+
+        if skip_index is not None:
+            r2[:, int(skip_index)] = np.inf
+
+        denom = (r2 + a2) ** 1.5
+        valid = np.isfinite(denom) & (denom > 0.0)
+        inv_d = np.where(valid, 1.0 / np.where(valid, denom, 1.0), 0.0)
+
+        cr = np.cross(dl[None, :, :], r)                      # (M, n, 3)
+        B  = np.einsum('mn,mni->mi', inv_d, cr)               # (M, 3)
+        B *= 1e-7 * I * N
+        return B
+
     def _bfield_vec(self, points, skip_index=None, core_radius=1e-4):
         """
         Vectorized Biot-Savart law for one or more observation points.
@@ -182,33 +237,9 @@ class CoilAnalysis:
         Returns B with the same leading shape as points: (3,) or (M, 3).
         """
         single = (np.ndim(points) == 1)
-        pts = np.atleast_2d(np.asarray(points, dtype=np.float64))  # (M, 3)
-
-        I = float(self.current)
-        N = float(self.winds)
-        a2 = float(core_radius) ** 2
-        if not np.isfinite(a2) or a2 <= 0.0:
-            a2 = 1e-8
-
-        coords = self.coords  # (n+1, 3), float64 contiguous after _compute_pca
-        dl  = coords[1:] - coords[:-1]          # (n, 3)
-        mid = 0.5 * (coords[:-1] + coords[1:])  # (n, 3)
-
-        # displacement vectors: r[m, j] = pts[m] - mid[j]
-        r  = pts[:, None, :] - mid[None, :, :]          # (M, n, 3)
-        r2 = np.einsum('mni,mni->mn', r, r)              # (M, n)
-
-        if skip_index is not None:
-            r2[:, int(skip_index)] = np.inf  # zeroes this segment's contribution
-
-        denom = (r2 + a2) ** 1.5                         # (M, n)
-        valid = np.isfinite(denom) & (denom > 0.0)
-        inv_d = np.where(valid, 1.0 / np.where(valid, denom, 1.0), 0.0)
-
-        cr = np.cross(dl[None, :, :], r)                 # (M, n, 3)
-        B  = np.einsum('mn,mni->mi', inv_d, cr)          # (M, 3)
-        B *= 1e-7 * I * N                                 # mu0/4pi = 1e-7
-
+        pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+        B = self._bfield_from_source(pts, self.coords, self.current, self.winds,
+                                      skip_index=skip_index, core_radius=core_radius)
         return B[0] if single else B
 
     def _bfield_vec_planar(self, points, skip_index=None, core_radius=None, skip_neighbors=2):
@@ -279,6 +310,169 @@ class CoilAnalysis:
         return B[0] if single else B
 
     # ------------------------------------------------------------------
+    # Volumetric (multi-filament) Biot-Savart
+    # ------------------------------------------------------------------
+
+    def _build_filament_grid(self, n_r=0, n_a=0):
+        """
+        Discretize the rectangular winding-pack cross-section into sub-filaments
+        using Gauss-Legendre quadrature.
+
+        REBCO winding: tape wraps around the coil form, each turn adding one
+        tape_thickness radially.
+          - **radial** extent = total_thickness = winds × tape_thickness
+                                (turns stack outward from the form)
+          - **axial** extent  = tape_width  (ribbon width along the axis)
+
+        Parameters
+        ----------
+        n_r : radial subdivisions (0 = auto-scale from winds)
+        n_a : axial subdivisions  (0 = auto-scale from geometry)
+
+        After this call, self._fil_coords, self._fil_weights, self._n_fil,
+        and self._fil_dl / self._fil_mid are populated.
+        """
+        # Auto-scale: radial subs from winds (stacked turns), axial from aspect ratio
+        if n_r <= 0:
+            n_r = min(int(self.winds), 4) if self.winds > 1 else 1
+        if n_a <= 0:
+            ratio = self.tape_width / max(self.total_thickness, 1e-10)
+            n_a = max(1, min(4, round(ratio)))
+
+        if n_r == 1 and n_a == 1:
+            # Filamentary mode — single centerline
+            self._n_fil = 1
+            self._fil_coords  = [self.coords]
+            self._fil_weights = np.array([1.0])
+            self._fil_dl  = [self._dl]
+            self._fil_mid = [self.midpoints]
+            return
+
+        # Gauss-Legendre nodes in [-1, 1] → physical offsets
+        r_nodes, r_wts = np.polynomial.legendre.leggauss(n_r)
+        a_nodes, a_wts = np.polynomial.legendre.leggauss(n_a)
+
+        # REBCO: radial extent = total_thickness, axial extent = tape_width
+        half_r = self.total_thickness * 0.5     # radial half-extent
+        half_a = self.tape_width * 0.5          # axial half-extent
+        r_phys = r_nodes * half_r    # (n_r,) radial offsets in metres
+        a_phys = a_nodes * half_a    # (n_a,) axial offsets in metres
+
+        # 2D weights (outer product, normalized so they sum to 1)
+        wts_2d = np.outer(r_wts, a_wts).ravel()
+        wts_2d /= wts_2d.sum()
+
+        # Local frame per vertex: e_r (radial outward), e_ax (PCA axis)
+        e_ax = self.axis / (np.linalg.norm(self.axis) + 1e-30)
+
+        # Radial direction at each vertex (perpendicular to axis, outward from mean)
+        dx = self.coords - self.mean_point                       # (n+1, 3)
+        proj = np.einsum('ij,j->i', dx, e_ax)[:, None] * e_ax   # axial component
+        radial = dx - proj                                        # (n+1, 3)
+        r_mag  = np.linalg.norm(radial, axis=1, keepdims=True).clip(1e-10)
+        e_r    = radial / r_mag                                   # (n+1, 3)
+
+        # Build offset paths for each (r_j, a_k) quadrature point
+        n_fil = n_r * n_a
+        fil_coords  = []
+        fil_dl      = []
+        fil_mid     = []
+        for j in range(n_r):
+            for k in range(n_a):
+                offset = r_phys[j] * e_r + a_phys[k] * e_ax      # (n+1, 3)
+                fc = self.coords + offset                          # (n+1, 3)
+                fc = np.ascontiguousarray(fc, dtype=np.float64)
+                fil_coords.append(fc)
+                fd = fc[1:] - fc[:-1]
+                fil_dl.append(fd)
+                fil_mid.append(0.5 * (fc[:-1] + fc[1:]))
+
+        self._n_fil       = n_fil
+        self._fil_coords  = fil_coords     # list of (n+1, 3)
+        self._fil_weights = wts_2d          # (n_fil,)
+        self._fil_dl      = fil_dl          # list of (n, 3)
+        self._fil_mid     = fil_mid         # list of (n, 3)
+
+    def _bfield_vec_volumetric(self, points, skip_index=None, core_radius=1e-4):
+        """
+        B-field from a finite cross-section coil, computed as a weighted sum
+        of sub-filament contributions using Gauss-Legendre quadrature.
+
+        When n_fil == 1, delegates directly to _bfield_vec (zero overhead).
+        """
+        if self._n_fil <= 1:
+            return self._bfield_vec(points, skip_index=skip_index,
+                                     core_radius=core_radius)
+
+        single = (np.ndim(points) == 1)
+        pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+        M = pts.shape[0]
+        I = float(self.current)
+        N = float(self.winds)
+
+        B = np.zeros((M, 3), dtype=np.float64)
+        for f in range(self._n_fil):
+            # Each sub-filament carries weighted current; total sums to I*N
+            B_f = self._bfield_from_source(
+                pts, self._fil_coords[f], I, N,
+                skip_index=skip_index, core_radius=core_radius,
+            )
+            B += self._fil_weights[f] * B_f
+
+        return B[0] if single else B
+
+    # ------------------------------------------------------------------
+    # Total B-field wrappers (self-field + external contributions)
+    # ------------------------------------------------------------------
+
+    def _total_bfield(self, points, skip_index=None, core_radius=1e-4):
+        """Self-field (volumetric if available) + B_ext from other coils."""
+        if self._n_fil > 1:
+            B = self._bfield_vec_volumetric(points, skip_index=skip_index,
+                                             core_radius=core_radius)
+        else:
+            B = self._bfield_vec(points, skip_index=skip_index,
+                                  core_radius=core_radius)
+        if self._B_ext is not None:
+            single = (np.ndim(points) == 1)
+            pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+            B_e = np.atleast_2d(self._B_ext(pts))
+            B = np.atleast_2d(B) + B_e
+            if single:
+                B = B[0]
+        return B
+
+    def _total_bfield_planar(self, points, skip_index=None,
+                              core_radius=None, skip_neighbors=2):
+        """Planar self-field + B_ext from other coils (superposition)."""
+        B = self._bfield_vec_planar(points, skip_index=skip_index,
+                                     core_radius=core_radius,
+                                     skip_neighbors=skip_neighbors)
+        # For planar coils, add volumetric correction if n_fil > 1
+        # (planar kernel handles its own skip logic; volumetric adds the
+        #  cross-section spread that the planar kernel doesn't capture)
+        if self._B_ext is not None:
+            single = (np.ndim(points) == 1)
+            pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+            B_e = np.atleast_2d(self._B_ext(pts))
+            B = np.atleast_2d(B) + B_e
+            if single:
+                B = B[0]
+        return B
+
+    def _smooth_bfield(self, points):
+        """Filamentary self-field + B_ext.  Used for field-line visualization
+        to avoid artifacts from multi-filament near-field structure."""
+        B = self._bfield_vec(points)
+        if self._B_ext is not None:
+            single = (np.ndim(points) == 1)
+            pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+            B = np.atleast_2d(B) + np.atleast_2d(self._B_ext(pts))
+            if single:
+                B = B[0]
+        return B
+
+    # ------------------------------------------------------------------
     # Legacy scalar wrappers (preserved for API compatibility)
     # ------------------------------------------------------------------
 
@@ -309,7 +503,7 @@ class CoilAnalysis:
         dl_i = self._dl[i]                                      # (3,)
         p0_i = self._p0[i]                                      # (3,)
         pts  = p0_i + self._gauss_ts16[:, None] * dl_i          # (16, 3)
-        B_all = self._bfield_vec(pts, skip_index=i)             # (16, 3)
+        B_all = self._total_bfield(pts, skip_index=i)           # (16, 3)
         crosses = np.cross(dl_i[None], B_all)                   # (16, 3)
         F_i = self._gauss_ws16 @ crosses                        # (3,)
         return self.current * self.winds * F_i
@@ -326,7 +520,7 @@ class CoilAnalysis:
         wts[1:-1:2] = 4
         wts[2:-1:2] = 2
         pts  = p0 + ts[:, None] * dl                           # (p+1, 3)
-        B_all = self._bfield_vec(pts, skip_index=i)            # (p+1, 3)
+        B_all = self._total_bfield(pts, skip_index=i)          # (p+1, 3)
         crosses = np.cross(dl[None], B_all)                    # (p+1, 3)
         F_acc = wts @ crosses                                  # (3,)
         return (self.current * self.winds) * (h / 3.0) * F_acc
@@ -337,7 +531,7 @@ class CoilAnalysis:
         dl_i = self._dl[i]
         p0_i = self._p0[i]
         pts  = p0_i + self._gauss_ts16[:, None] * dl_i         # (16, 3)
-        B_all = self._bfield_vec_planar(
+        B_all = self._total_bfield_planar(
             pts, skip_index=i, core_radius=core_radius, skip_neighbors=skip_neighbors
         )                                                        # (16, 3)
         crosses = np.cross(dl_i[None], B_all)                   # (16, 3)
@@ -357,7 +551,7 @@ class CoilAnalysis:
         wts[1:-1:2] = 4
         wts[2:-1:2] = 2
         pts  = p0 + ts[:, None] * dl                           # (p+1, 3)
-        B_all = self._bfield_vec_planar(
+        B_all = self._total_bfield_planar(
             pts, skip_index=i, core_radius=core_radius, skip_neighbors=skip_neighbors
         )                                                        # (p+1, 3)
         crosses = np.cross(dl[None], B_all)                    # (p+1, 3)
@@ -442,7 +636,7 @@ class CoilAnalysis:
     # ------------------------------------------------------------------
 
     def _compute_bfield_at_centroid(self):
-        B = self._bfield_vec(self.mean_point)
+        B = self._total_bfield(self.mean_point)
         self.B_total     = B
         self.B_magnitude = np.linalg.norm(B)
         self.B_axial     = abs(np.dot(B, self.axis))
@@ -620,7 +814,7 @@ class CoilAnalysis:
         zs  = np.linspace(-0.5 * L, 0.5 * L, num)
         pts = self.mean_point + zs[:, None] * self.axis  # (num, 3)
 
-        B_vecs = self._bfield_vec(pts)                   # (num, 3)
+        B_vecs = self._total_bfield(pts)                  # (num, 3)
         Bs     = np.linalg.norm(B_vecs, axis=1)          # (num,)
         return zs, Bs
 
@@ -663,7 +857,7 @@ class CoilAnalysis:
         mags  = np.empty(len(pts), dtype=np.float64)
         for start in range(0, len(pts), chunk):
             end         = min(start + chunk, len(pts))
-            B_batch     = self._bfield_vec(pts[start:end])          # (c, 3)
+            B_batch     = self._total_bfield(pts[start:end])         # (c, 3)
             mags[start:end] = np.linalg.norm(B_batch, axis=1)
 
         Bmag[mask] = mags
@@ -722,7 +916,7 @@ class CoilAnalysis:
             mags = np.empty(len(pts), dtype=np.float64)
             for start in range(0, len(pts), chunk):
                 end = min(start + chunk, len(pts))
-                B   = self._bfield_vec(pts[start:end])  # (c, 3) — vectorized
+                B   = self._total_bfield(pts[start:end])  # (c, 3) — vectorized
                 mags[start:end] = np.linalg.norm(B, axis=1)
 
             planes[k][circ] = mags
@@ -771,7 +965,7 @@ class CoilAnalysis:
 
         for ci in range(n_ch):
             sl = slice(ci * chunk, min((ci + 1) * chunk, N))
-            B_flat[sl] = np.linalg.norm(self._bfield_vec(pts[sl]), axis=1)
+            B_flat[sl] = np.linalg.norm(self._total_bfield(pts[sl]), axis=1)
             if progress_callback:
                 progress_callback(int(100 * (ci + 1) / n_ch))
 
@@ -782,9 +976,10 @@ class CoilAnalysis:
         """
         Compute 3D magnetic field line traces using batched RK4 integration.
 
-        Seeds n_seeds points on a Fibonacci sphere of radius ~0.6×coil_radius
-        around the coil centroid, then integrates both forward (sign=+1) and
-        backward (sign=-1) along the normalised B-field direction.
+        Uses two complementary seed sets (each ~n_seeds/2):
+          - Fibonacci sphere at 0.6×R from centroid — exterior / return-path lines
+          - Sunflower disk in the midplane (0→0.85R) — interior / axial bore lines
+        Integrates both forward (+1) and backward (−1) from every seed.
 
         Returns
         -------
@@ -798,25 +993,72 @@ class CoilAnalysis:
         step  = R * 0.07          # integration step length (metres)
         max_r = R * max_radius_factor
 
-        # Fibonacci-lattice seeds on a sphere of radius 0.6×R
         golden = (1.0 + 5.0 ** 0.5) / 2.0
-        seeds  = np.zeros((n_seeds, 3), dtype=np.float64)
-        for k in range(n_seeds):
-            theta     = np.arccos(max(-1.0, min(1.0, 1.0 - 2.0 * (k + 0.5) / n_seeds)))
-            phi       = 2.0 * np.pi * k / golden
-            seeds[k]  = self.mean_point + (R * 0.60) * np.array([
+
+        # ── Seed set 1: Fibonacci sphere at 0.6×R (exterior / return-path lines) ──
+        n_sphere = max(1, n_seeds // 2)
+        sphere_seeds = np.zeros((n_sphere, 3), dtype=np.float64)
+        for k in range(n_sphere):
+            theta = np.arccos(max(-1.0, min(1.0, 1.0 - 2.0 * (k + 0.5) / n_sphere)))
+            phi   = 2.0 * np.pi * k / golden
+            sphere_seeds[k] = self.mean_point + (R * 0.60) * np.array([
                 np.sin(theta) * np.cos(phi),
                 np.sin(theta) * np.sin(phi),
                 np.cos(theta),
             ])
+
+        # ── Seed set 2: cylinder aligned with PCA axis (interior / axial lines) ──
+        # Seeds are distributed throughout the full axial extent and radial interior
+        # of the coil, not just in a single midplane.  z and r use INDEPENDENT
+        # quasi-random sequences so they are not correlated with each other — this
+        # avoids the spiral bias that caused visual imbalance for non-circular coils.
+        a  = self.axis / (np.linalg.norm(self.axis) + 1e-30)
+        helper = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        e1 = np.cross(a, helper);  e1 /= np.linalg.norm(e1)
+        e2 = np.cross(a, e1)
+
+        axial_proj = np.dot(self.midpoints - self.mean_point, a)
+        z_lo   = float(axial_proj.min())
+        z_hi   = float(axial_proj.max())
+        z_span = max(z_hi - z_lo, R * 0.20)   # at least 20 % of R for planar coils
+
+        PHI_FRAC = 1.0 / golden               # ≈ 0.6180 — independent low-discrepancy step
+
+        n_cyl = n_seeds - n_sphere
+        cyl_seeds = np.zeros((n_cyl, 3), dtype=np.float64)
+        for k in range(n_cyl):
+            # r: uniform area density from 0 to 0.80 R  (sqrt of linear sequence)
+            t_r = (k + 0.5) / n_cyl
+            r   = R * 0.80 * np.sqrt(t_r)
+            # z: independent Fibonacci quasi-random sequence — no correlation with r
+            t_z = (k * PHI_FRAC) % 1.0
+            z   = z_lo + t_z * z_span
+            phi = 2.0 * np.pi * k / golden
+            cyl_seeds[k] = self.mean_point + z * a + r * (np.cos(phi) * e1 + np.sin(phi) * e2)
+
+        seeds = np.vstack([sphere_seeds, cyl_seeds])
+
+        # Exclude seeds inside the winding pack — they produce non-physical
+        # looking traces that visually penetrate the rendered tube.
+        conductor_r = max(self.total_thickness, self.tape_width) * 0.6
+        if conductor_r > 0:
+            min_dist = np.min(
+                np.linalg.norm(
+                    seeds[:, None, :] - self.midpoints[None, :, :], axis=2
+                ),
+                axis=1,
+            )
+            seeds = seeds[min_dist > conductor_r]
+
+        n_total = len(seeds)
 
         all_lines: list = []
         all_B:     list = []
 
         for d_idx, sign in enumerate((1.0, -1.0)):
             pts    = seeds.copy()
-            active = np.ones(n_seeds, dtype=bool)
-            trajs  = [[seeds[i].copy()] for i in range(n_seeds)]
+            active = np.ones(n_total, dtype=bool)
+            trajs  = [[seeds[i].copy()] for i in range(n_total)]
 
             for s in range(n_steps):
                 if not active.any():
@@ -824,9 +1066,11 @@ class CoilAnalysis:
                 ai  = np.where(active)[0]
                 ap  = pts[ai]           # (n_active, 3)
 
-                # RK4 — four batched _bfield_vec calls per step
+                # RK4 — four batched calls per step.
+                # Use _smooth_bfield (filamentary self + B_ext) to avoid
+                # artifacts from multi-filament near-field structure.
                 def unit_B(p):
-                    B   = self._bfield_vec(p)
+                    B   = self._smooth_bfield(p)
                     mag = np.linalg.norm(B, axis=-1, keepdims=True).clip(1e-30)
                     return B / mag
 
@@ -839,6 +1083,18 @@ class CoilAnalysis:
 
                 dist = np.linalg.norm(new_ap - self.mean_point, axis=1)
                 active[ai[dist >= max_r]] = False
+
+                # Terminate field lines that enter the winding pack
+                if conductor_r > 0:
+                    wire_dist = np.min(
+                        np.linalg.norm(
+                            new_ap[:, None, :] - self.midpoints[None, :, :],
+                            axis=2,
+                        ),
+                        axis=1,
+                    )
+                    active[ai[wire_dist < conductor_r]] = False
+
                 for j, i in enumerate(ai):
                     if active[i]:
                         trajs[i].append(new_ap[j].copy())
@@ -847,14 +1103,14 @@ class CoilAnalysis:
                     pct = int(100 * (d_idx + s / n_steps) / 2)
                     progress_callback(min(pct, 99))
 
-            for i in range(n_seeds):
+            for i in range(n_total):
                 if len(trajs[i]) < 3:
                     continue
                 pts_arr  = np.array(trajs[i], dtype=np.float32)
                 B_chunks = []
                 chunk    = 300
                 for ci in range(0, len(pts_arr), chunk):
-                    Bc = self._bfield_vec(pts_arr[ci:ci+chunk].astype(np.float64))
+                    Bc = self._smooth_bfield(pts_arr[ci:ci+chunk].astype(np.float64))
                     B_chunks.append(np.linalg.norm(Bc, axis=1).astype(np.float32))
                 all_lines.append(pts_arr)
                 all_B.append(np.concatenate(B_chunks))
@@ -900,7 +1156,7 @@ class CoilAnalysis:
         n_ch   = max(1, (N + chunk - 1) // chunk)
         for ci in range(n_ch):
             sl          = slice(ci * chunk, min((ci + 1) * chunk, N))
-            B_flat[sl]  = np.linalg.norm(self._bfield_vec(pts[sl]), axis=1)
+            B_flat[sl]  = np.linalg.norm(self._total_bfield(pts[sl]), axis=1)
             if progress_callback:
                 progress_callback(int(100 * (ci + 1) / n_ch))
 
