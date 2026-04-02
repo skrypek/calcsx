@@ -15,7 +15,7 @@ CalcSX™ is a desktop GUI for simulating and analyzing the electromagnetic and 
 - **Hoop stress** via membrane decomposition, including radial stress profiles
 - **3-D magnetic field lines** traced via batched RK4 integration through the superposed field
 - **Cross-sectional B-field maps** — interactive 2D heatmap sliced through any plane along the axis of symmetry
-- **Multi-coil interactions** — superposition of B-fields from all coils; forces account for neighbouring coil contributions
+- **Multi-coil interactions** — superposition of B-fields from all coils; forces account for neighboring coil contributions
 - **Volumetric current carrying** — finite winding-pack cross-section via Gauss-Legendre sub-filament discretization
 
 The coil geometry is analyzed with PCA to determine the axis of symmetry automatically.
@@ -29,7 +29,7 @@ The coil geometry is analyzed with PCA to determine the axis of symmetry automat
 | Change | Detail |
 |---|---|
 | **Physics-aware environment** | `MultiCoilEnvironment` orchestrator tracks all coils; B-field from each coil includes contributions from every other coil via superposition |
-| **External field injection** | Each `CoilAnalysis` engine receives a `B_ext` callback that sums Biot-Savart from all neighbouring coils — forces, stresses, and field lines see the full multi-coil field |
+| **External field injection** | Each `CoilAnalysis` engine receives a `B_ext` callback that sums Biot-Savart from all neighboring coils — forces, stresses, and field lines see the full multi-coil field |
 | **Per-coil analysis** | Each coil stores its own engine; analyses are independent — adding or re-analyzing one coil doesn't destroy another's results |
 | **Staleness tracking** | Adding, removing, or moving a coil marks all others stale (browser warning icon); **Re-analyze All** button processes the queue sequentially |
 | **Global field lines** | Toggle in INSPECT tab traces field lines through the superposed B-field of all coils simultaneously; mutually exclusive with per-coil field lines |
@@ -57,10 +57,10 @@ The coil geometry is analyzed with PCA to determine the axis of symmetry automat
 
 | Change | Detail |
 |---|---|
-| **Navigation ViewCube** | Fusion 360-style orientation cube in top-right corner; click faces for preset views, drag corners for quick orbit; themes with the active mode |
+| **Navigation ViewCube** | Classic CAD-style orientation cube in top-right corner; click faces for preset views, drag corners for quick orbit; themes with the active mode |
 | **Per-coil parameters** | Winds, current, tape thickness, and tape width are stored independently per coil; switching selection in the browser loads that coil's parameters into the Properties panel |
 | **Seamless gizmo switching** | Selecting a different coil while Translate or Rotate is active moves the gizmo to the new coil's centroid automatically |
-| **Coil re-colouring** | Click any coil's colour swatch in the browser to open a colour picker |
+| **Coil re-coloring** | Click any coil's color swatch in the browser to open a color picker |
 | **Non-overlapping scalar bars** | Multiple legends stack vertically and resize dynamically |
 | **Parameter-driven staleness** | Changing any coil parameter (winds, current, etc.) marks all analyses stale and updates the tube rendering in real time |
 | **Normalize Forces** | Moved to UTILITIES ribbon tab as a toggle button |
@@ -73,7 +73,7 @@ The coil geometry is analyzed with PCA to determine the axis of symmetry automat
 |---|---|
 | **2.1.0** | Multi-coil superposition; volumetric REBCO current carrying; dark/light themes; navigation ViewCube; per-coil parameters; global field lines |
 | 2.0.0 | INSPECT tools (field lines, cross section); interactive transform gizmo |
-| 1.3.0 | Full PyVista/VTK 3-D backend; Fusion 360 workbench; B-field volume |
+| 1.3.0 | Full PyVista/VTK 3-D backend; CAD style workbench; B-field volume |
 | 1.2.0 | Two-panel workbench; dark theme throughout; B-field slice viewer |
 | 1.1.0 | Vectorized Biot-Savart kernel (10–50× speedup); chunked cross-section |
 | 1.0.0 | Initial release: CSV loading, Biot-Savart, PyQt5 GUI |
@@ -87,15 +87,15 @@ The coil geometry is analyzed with PCA to determine the axis of symmetry automat
 | Coil Visualization | Swept rectangular tube showing winding-pack cross-section, with centerline wire overlay |
 | Multi-Coil Superposition | B-fields from all coils are summed; forces on each coil account for the full environment |
 | Volumetric Current | Gauss-Legendre sub-filament discretization of the REBCO winding pack |
-| Lorentz Force Layer | Per-segment J×B arrow glyphs, coloured by magnitude |
-| Hoop Stress Layer | Midpoint point cloud coloured by hoop stress (MPa) |
-| On-Axis B-Field Layer | Point cloud along the PCA axis coloured by \|B\| |
+| Lorentz Force Layer | Per-segment J×B arrow glyphs, colored by magnitude |
+| Hoop Stress Layer | Midpoint point cloud colored by hoop stress (MPa) |
+| On-Axis B-Field Layer | Point cloud along the PCA axis colored by \|B\| |
 | Field Lines (INSPECT) | 3-D magnetic streamlines with conductor exclusion; per-coil or global mode |
 | Cross Section (INSPECT) | 2-D B-field heatmap in any plane along the axis |
 | Global Field Lines | Superposed field topology across all coils via toggle in INSPECT tab |
-| Layer Browser | Eye-icon toggles per layer; colour swatches; rename and recolour coils |
+| Layer Browser | Eye-icon toggles per layer; color swatches; rename and recolor coils |
 | Ribbon Toolbar | SIMULATION / INSPECT / CONSTRUCT / UTILITIES tabs |
-| Navigation Cube | Fusion 360-style ViewCube with click-to-orient and drag-to-orbit |
+| Navigation Cube | CAD-style ViewCube with click-to-orient and drag-to-orbit |
 | Dark / Light Themes | Switchable via Settings in UTILITIES; viridis light mode, VS-Code dark mode |
 | Transform Gizmo | SolidWorks-style translate/rotate handles; seamless coil switching |
 
@@ -162,12 +162,12 @@ python -m CalcSX_app.main
 
 ### 3. Workflow
 
-The interface uses a **Fusion 360-style workbench**: ribbon at top, layer browser + properties on the left, 3-D viewport filling the rest.
+The interface uses a **CAD-style workbench**: ribbon at top, layer browser + properties on the left, 3-D viewport filling the rest.
 
 1. Click **Load CSV** in the ribbon — the coil appears as a rendered tube with its winding-pack cross-section visible.
 2. Set coil parameters in the Properties panel (winds, current, tape dimensions). Each coil stores its own parameters independently.
 3. Click **Run Analysis** — Forces, Stress, and B Axis layers appear under the coil in the browser.
-4. Load additional coils — each gets its own colour; existing analyses are marked stale. Use **Re-analyze All** to update.
+4. Load additional coils — each gets its own color; existing analyses are marked stale. Use **Re-analyze All** to update.
 5. Switch to the **INSPECT** tab:
    - **Field Lines** — traces 3-D field lines through the superposed B-field of all coils.
    - **Cross Section** — renders a 2-D B-field heatmap.
