@@ -1,6 +1,8 @@
 # gui_utils.py
-from PyQt5.QtCore import Qt, QTimer, QObject
-from PyQt5.QtGui import QPalette, QColor, QFont, QFontDatabase
+import sys
+from pathlib import Path
+from PyQt5.QtCore import Qt, QTimer, QObject, QSize
+from PyQt5.QtGui import QPalette, QColor, QFont, QFontDatabase, QIcon, QPixmap
 import random
 import time
 from PyQt5.QtWidgets import (
@@ -105,6 +107,28 @@ def set_theme(name: str) -> None:
 
 def get_theme_name() -> str:
     return _current_theme_name
+
+
+_IMG_SIZES = (16, 32, 64, 128, 256, 512, 1024)
+
+
+def _resources_dir() -> Path:
+    """Resolve the resources/images folder whether running frozen or from source."""
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "resources" / "images"
+    return Path(__file__).resolve().parent.parent / "resources" / "images"
+
+
+def get_app_icon(theme: str | None = None) -> QIcon:
+    """Return the multi-size app QIcon for the given theme (defaults to current)."""
+    theme = theme if theme in ('light', 'dark') else _current_theme_name
+    base = _resources_dir()
+    icon = QIcon()
+    for sz in _IMG_SIZES:
+        fp = base / f"app_{theme}-{sz}.png"
+        if fp.exists():
+            icon.addFile(str(fp), QSize(sz, sz))
+    return icon
 
 # ─────────────────────────────────────────────────────────────
 # Application-level dark setup helpers

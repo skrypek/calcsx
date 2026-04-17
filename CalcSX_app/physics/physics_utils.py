@@ -259,7 +259,9 @@ class CoilAnalysis:
         inv_d = np.where(valid, 1.0 / np.where(valid, denom, 1.0), 0.0)
 
         cr = np.cross(dl[None, :, :], r)                      # (M, n, 3)
+        del r, r2, denom, valid                                # free large temps
         B  = np.einsum('mn,mni->mi', inv_d, cr)               # (M, 3)
+        del inv_d, cr
         B *= 1e-7 * I * N
         return B
 

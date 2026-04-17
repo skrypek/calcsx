@@ -54,7 +54,7 @@ from PyQt5.QtGui import QPixmap
 
 from physics.physics_utils import CoilAnalysis
 from physics.superposition import MultiCoilEnvironment
-from gui.gui_utils import ProgressReporter, THEME
+from gui.gui_utils import ProgressReporter, THEME, get_app_icon
 from views.workspace_3d import Workspace3DView
 
 from version import __version__ as version_module
@@ -1185,9 +1185,9 @@ class PropertiesPanel(QScrollArea):
         ilbl = QLabel("Field Seeds:")
         ilbl.setObjectName('dim_label')
         self.spin_field_seeds = QSpinBox()
-        self.spin_field_seeds.setRange(8, 60)
+        self.spin_field_seeds.setRange(8, 100)
         self.spin_field_seeds.setSingleStep(4)
-        self.spin_field_seeds.setValue(20)
+        self.spin_field_seeds.setValue(24)
         irow.addWidget(ilbl)
         irow.addWidget(self.spin_field_seeds, stretch=1)
         lay.addLayout(irow)
@@ -1367,7 +1367,7 @@ class HelpDialog(QDialog):
 class SettingsDialog(QDialog):
     """Application settings — theme toggle + dev settings."""
     theme_changed              = pyqtSignal(str)    # 'dark' | 'light'
-    export_gltf_requested      = pyqtSignal()
+    export_vtk_requested       = pyqtSignal()
     export_web_layers_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -1408,13 +1408,13 @@ class SettingsDialog(QDialog):
         dev_lay = QVBoxLayout(self._dev_frame)
         dev_lay.setContentsMargins(16, 4, 0, 4)
 
-        self._btn_export_gltf = QPushButton("Export glTF Layers…")
-        self._btn_export_gltf.setFixedHeight(28)
-        self._btn_export_gltf.setToolTip(
-            "Export each coil and analysis layer as a separate .gltf file"
+        self._btn_export_vtk = QPushButton("Export VTK (ParaView)…")
+        self._btn_export_vtk.setFixedHeight(28)
+        self._btn_export_vtk.setToolTip(
+            "Export coil geometry and analysis data as .vtp files for ParaView"
         )
-        self._btn_export_gltf.clicked.connect(self.export_gltf_requested.emit)
-        dev_lay.addWidget(self._btn_export_gltf)
+        self._btn_export_vtk.clicked.connect(self.export_vtk_requested.emit)
+        dev_lay.addWidget(self._btn_export_vtk)
 
         self._btn_export_web = QPushButton("Export Web Layers…")
         self._btn_export_web.setFixedHeight(28)
@@ -1456,7 +1456,7 @@ class CoilGeneratorDialog(QDialog):
         row = QHBoxLayout()
         row.addWidget(QLabel("Shape:"))
         self._combo = QComboBox()
-        self._combo.addItems(["Solenoid", "Racetrack", "D-Shape", "Saddle", "CCT"])
+        self._combo.addItems(["Solenoid", "Princeton Dee", "Saddle", "CCT"])
         self._combo.currentIndexChanged.connect(self._on_shape_changed)
         row.addWidget(self._combo, stretch=1)
         lay.addLayout(row)
@@ -1518,19 +1518,16 @@ class CoilGeneratorDialog(QDialog):
             self._spins[label] = s
 
         if shape == "Solenoid":
-            _dspin("Radius (m):", 0.5, 0.001, 50.0, suffix=" m")
-            _dspin("Pitch (m):", 0.01, 0.001, 1.0, suffix=" m")
-            _ispin("Turns:", 10, 1, 10000)
-            _ispin("Pts/turn:", 100, 20, 1000, step=20)
-        elif shape == "Racetrack":
-            _dspin("End radius (m):", 0.2, 0.001, 10.0, suffix=" m")
-            _dspin("Straight (m):", 0.5, 0.001, 20.0, suffix=" m")
-            _ispin("Points:", 400, 100, 5000, step=100)
-        elif shape == "D-Shape":
-            _dspin("R inner (m):", 0.3, 0.01, 10.0, suffix=" m")
-            _dspin("R outer (m):", 0.8, 0.01, 20.0, suffix=" m")
-            _dspin("Height (m):", 1.0, 0.01, 20.0, suffix=" m")
-            _ispin("Points:", 400, 100, 5000, step=100)
+            _dspin("Radius (m):", 0.05, 0.001, 50.0, suffix=" m")
+            _dspin("Pitch (m):", 0.003, 0.0001, 1.0, suffix=" m")
+            _ispin("Turns:", 6, 1, 10000)
+            _ispin("Pts/turn:", 60, 20, 1000, step=20)
+        elif shape == "Princeton Dee":
+            _dspin("R inner (m):", 0.025, 0.001, 10.0, suffix=" m")
+            _dspin("R outer (m):", 0.078, 0.001, 20.0, suffix=" m")
+            _dspin("Height (m):", 0.132, 0.001, 20.0, suffix=" m")
+            _dspin("Corner R (m):", 0.0, 0.0, 5.0, suffix=" m")
+            _ispin("Points:", 300, 100, 5000, step=100)
         elif shape == "Saddle":
             _dspin("Radius (m):", 0.5, 0.001, 10.0, suffix=" m")
             _dspin("Length (m):", 1.0, 0.01, 20.0, suffix=" m")
@@ -1545,7 +1542,7 @@ class CoilGeneratorDialog(QDialog):
 
     def _generate(self):
         from physics.geometry import (
-            generate_solenoid, generate_racetrack, generate_d_shape,
+            generate_solenoid, generate_princeton_dee,
             generate_saddle_coil, generate_cct,
         )
         shape = self._combo.currentText()
@@ -1558,17 +1555,12 @@ class CoilGeneratorDialog(QDialog):
                     n_turns=s["Turns:"].value(),
                     n_pts_per_turn=s["Pts/turn:"].value(),
                 )
-            elif shape == "Racetrack":
-                self._coords = generate_racetrack(
-                    R_end=s["End radius (m):"].value(),
-                    L_straight=s["Straight (m):"].value(),
-                    n_pts=s["Points:"].value(),
-                )
-            elif shape == "D-Shape":
-                self._coords = generate_d_shape(
+            elif shape == "Princeton Dee":
+                self._coords = generate_princeton_dee(
                     R_inner=s["R inner (m):"].value(),
                     R_outer=s["R outer (m):"].value(),
                     height=s["Height (m):"].value(),
+                    corner_radius=s["Corner R (m):"].value(),
                     n_pts=s["Points:"].value(),
                 )
             elif shape == "Saddle":
@@ -2942,6 +2934,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"CalcSX™ – v{__version__}")
+        self.setWindowIcon(get_app_icon())
         self.resize(1280, 800)
 
         self._coords   = None
@@ -3449,12 +3442,11 @@ class MainWindow(QMainWindow):
         for nm in ('Forces', 'Stress', 'B Axis', 'Field Lines', 'Cross Section'):
             self.browser.mark_layer_stale(cid, nm, False)
 
-        self.reporter.set_stage("Building force visualization…")
+        self.reporter.set_stage("Computing per-vertex forces…")
         self.reporter.report(87)
 
         def _force_progress(done, total):
-            pct = 87 + int(8 * done / max(total, 1))
-            self.reporter.report(pct)
+            self.reporter.report(87 + int(8 * done / max(total, 1)))
 
         norm = self.ribbon._btn_normalize.isChecked()
         self.workspace.add_force_layer(engine, cid, normalized=norm,
@@ -3548,10 +3540,16 @@ class MainWindow(QMainWindow):
                 self.browser.set_layer_eye_locked(cid, 'Field Lines', locked=True)
             # Disable per-coil field lines button while global is on
             self.ribbon._btn_field_lines.set_action_enabled(False)
-            # Use cached result if available and environment hasn't changed
-            if not self._global_fl_dirty and self._global_fl_cache is not None:
+            # Use cached result if available, environment unchanged, and
+            # seed count matches what was used for the cache.
+            n_seeds = self.props.get_field_seeds()
+            cache_valid = (not self._global_fl_dirty
+                           and self._global_fl_cache is not None
+                           and getattr(self, '_global_fl_cache_seeds', 0) == n_seeds)
+            if cache_valid:
                 lines, B_mags = self._global_fl_cache
                 self.workspace.add_field_lines_layer(lines, B_mags, '__global__')
+                self.workspace.rescale_all_field_line_layers()
             else:
                 self._compute_global_field_lines()
         else:
@@ -3591,8 +3589,10 @@ class MainWindow(QMainWindow):
         self._i_worker = None
         lines, B_mags = data
         self._global_fl_cache = (lines, B_mags)
+        self._global_fl_cache_seeds = self.props.get_field_seeds()
         self._global_fl_dirty = False
         self.workspace.add_field_lines_layer(lines, B_mags, '__global__')
+        self.workspace.rescale_all_field_line_layers()
 
     def _on_normalize_forces_toggled(self, checked: bool = False) -> None:
         cid = self._active_coil_id
@@ -3642,6 +3642,7 @@ class MainWindow(QMainWindow):
         lines, B_mags = data
         cid = self._inspect_coil_id
         self.workspace.add_field_lines_layer(lines, B_mags, cid)
+        self.workspace.rescale_all_field_line_layers()
         if cid:
             self.browser.add_layer_to_coil(cid, 'Field Lines')
             # If global field mode is active, hide per-coil lines immediately
@@ -3739,23 +3740,24 @@ class MainWindow(QMainWindow):
     def _on_open_settings(self) -> None:
         dlg = SettingsDialog(self)
         dlg.theme_changed.connect(self._apply_theme)
-        dlg.export_gltf_requested.connect(lambda: self._export_gltf_layers(dlg))
+        dlg.export_vtk_requested.connect(lambda: self._export_vtk_layers(dlg))
         dlg.export_web_layers_requested.connect(lambda: self._export_web_layers(dlg))
         dlg.exec_()
 
-    def _export_gltf_layers(self, parent_dlg: QDialog) -> None:
-        """Prompt for output folder, then export every coil/layer as .gltf."""
+    def _export_vtk_layers(self, parent_dlg: QDialog) -> None:
+        """Prompt for output folder, then export coils/analysis as .vtp."""
         out_dir = QFileDialog.getExistingDirectory(
-            parent_dlg, "Select Export Folder", "",
+            parent_dlg, "Select VTK Export Folder", "",
             QFileDialog.ShowDirsOnly,
         )
         if not out_dir:
             return
-        exported = self.workspace.export_layers_gltf(out_dir)
+        exported = self.workspace.export_vtk_layers(out_dir)
         if exported:
             QMessageBox.information(
-                parent_dlg, "Export Complete",
-                f"Exported {len(exported)} glTF file(s) to:\n{out_dir}",
+                parent_dlg, "VTK Export Complete",
+                f"Exported {len(exported)} .vtp file(s) to:\n{out_dir}\n\n"
+                "Open in ParaView to visualize.",
             )
         else:
             QMessageBox.warning(
@@ -4080,6 +4082,12 @@ class MainWindow(QMainWindow):
         self.props.refresh_theme()
         # Update 3D viewport (background, floor, ViewCube)
         self.workspace.apply_theme()
+        # Swap window + application icon to match the new theme
+        themed_icon = get_app_icon(name)
+        self.setWindowIcon(themed_icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(themed_icon)
 
     # ── Hall probe handlers ──────────────────────────────────────────────────
 

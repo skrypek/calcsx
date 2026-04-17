@@ -287,18 +287,29 @@ def generate_racetrack(
     return coords
 
 
-def generate_d_shape(
-    R_inner: float = 0.3,
-    R_outer: float = 0.8,
-    height: float = 1.0,
-    n_pts: int = 400,
+def generate_princeton_dee(
+    R_inner: float = 0.025,
+    R_outer: float = 0.078,
+    height: float = 0.132,
+    corner_radius: float = 0.0,
+    n_pts: int = 300,
     center: np.ndarray = None,
 ) -> np.ndarray:
     """
-    D-shaped coil (tokamak TF coil profile).
+    Princeton Dee coil (tokamak TF coil profile).
 
-    The D-shape is a Princeton-D: inner leg is straight (at R_inner),
-    outer contour is an elliptical arc.
+    Straight inner leg, quarter-circle fillet arcs at top/bottom corners,
+    half-ellipse outer arc.  All four segments share exact junction points
+    for seamless closure.
+
+    Parameters
+    ----------
+    R_inner       : radial position of the straight inner leg (m)
+    R_outer       : peak radius of the outer arc (m)
+    height        : total vertical extent (m)
+    corner_radius : fillet radius at inner-leg corners (m); 0 = auto (15% of height)
+    n_pts         : total discretization points
+    center        : (3,) center offset; default origin
 
     Returns (N, 3) coordinate array in the X-Z plane.
     """
@@ -307,29 +318,56 @@ def generate_d_shape(
     center = np.asarray(center, dtype=np.float64)
 
     half_h = height / 2.0
-    n_half = n_pts // 2
+    r = corner_radius if corner_radius > 0 else 0.15 * height
 
-    # Inner leg: straight line at x = R_inner, from -half_h to +half_h
-    z_inner = np.linspace(-half_h, half_h, n_half)
-    x_inner = np.full_like(z_inner, R_inner)
+    # Clamp corner radius so it fits
+    r = min(r, half_h * 0.9, (R_outer - R_inner) * 0.4)
 
-    # Outer arc: ellipse centered at (R_inner, 0) with semi-axes (R_outer - R_inner, half_h)
-    a = R_outer - R_inner
-    b = half_h
-    theta = np.linspace(np.pi / 2, -np.pi / 2, n_half)
-    x_outer = R_inner + a * np.cos(theta)
-    z_outer = b * np.sin(theta)
+    # Ellipse semi-axes for outer arc
+    a_ell = R_outer - (R_inner + r)
+    b_ell = half_h
 
-    x = np.concatenate([x_inner, x_outer])
-    z = np.concatenate([z_inner, z_outer])
+    # Point budget (include shared endpoints so segments join exactly)
+    n_leg    = max(10, int(n_pts * 0.30))
+    n_corner = max(8,  int(n_pts * 0.10))
+    n_outer  = n_pts - n_leg - 2 * n_corner
+
+    # 1. Inner leg: (R_inner, H-r) -> (R_inner, -(H-r))
+    #    Include start, exclude end (shared with bottom corner)
+    z_leg = np.linspace(half_h - r, -(half_h - r), n_leg, endpoint=False)
+    x_leg = np.full_like(z_leg, R_inner)
+
+    # 2. Bottom corner arc: center (R_inner+r, -(H-r))
+    #    Include start, exclude end (shared with outer arc)
+    theta_bot = np.linspace(np.pi, 3*np.pi/2, n_corner, endpoint=False)
+    x_bot = (R_inner + r) + r * np.cos(theta_bot)
+    z_bot = -(half_h - r)  + r * np.sin(theta_bot)
+
+    # 3. Outer arc: half-ellipse, center (R_inner+r, 0)
+    #    Include start, exclude end (shared with top corner)
+    t_out = np.linspace(-np.pi/2, np.pi/2, n_outer, endpoint=False)
+    x_out = (R_inner + r) + a_ell * np.cos(t_out)
+    z_out = b_ell * np.sin(t_out)
+
+    # 4. Top corner arc: center (R_inner+r, H-r)
+    #    Include start, exclude end (shared with inner leg start = closure)
+    theta_top = np.linspace(np.pi/2, np.pi, n_corner, endpoint=False)
+    x_top = (R_inner + r) + r * np.cos(theta_top)
+    z_top = (half_h - r)   + r * np.sin(theta_top)
+
+    x = np.concatenate([x_leg, x_bot, x_out, x_top])
+    z = np.concatenate([z_leg, z_bot, z_out, z_top])
     y = np.zeros_like(x)
 
     coords = np.column_stack([x, y, z])
-    # Close
-    if not np.allclose(coords[0], coords[-1]):
-        coords = np.vstack([coords, coords[0]])
+    # Close: append exact copy of first point
+    coords = np.vstack([coords, coords[0]])
     coords -= coords.mean(axis=0) - center
     return coords
+
+
+# Backward-compatible alias
+generate_d_shape = generate_princeton_dee
 
 
 def generate_saddle_coil(
@@ -436,10 +474,24 @@ def generate_cct(
     n_total = n_turns * n_pts_per_turn + 1
     theta = np.linspace(0, 2 * np.pi * n_turns, n_total)
 
-    # Standard helix with canted modulation
+    # Forward winding with canted modulation
     x = radius * np.cos(theta + np.sin(theta) * np.tan(tilt))
     y = radius * np.sin(theta + np.sin(theta) * np.tan(tilt))
     z = pitch * theta / (2 * np.pi)
+
+    # Straight return path at slightly larger radius to avoid intersection
+    n_ret = n_pts_per_turn
+    z_end = z[-1]
+    z_ret = np.linspace(z_end, 0.0, n_ret, endpoint=False)[1:]
+    r_ret = radius * 1.05
+    # Hold the final azimuthal angle for the return
+    phi_end = theta[-1] + np.sin(theta[-1]) * np.tan(tilt)
+    x_ret = r_ret * np.cos(phi_end) * np.ones(len(z_ret))
+    y_ret = r_ret * np.sin(phi_end) * np.ones(len(z_ret))
+
+    x = np.concatenate([x, x_ret])
+    y = np.concatenate([y, y_ret])
+    z = np.concatenate([z, z_ret])
     z -= z.mean()
 
     coords = np.column_stack([x, y, z]) + center

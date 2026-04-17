@@ -7,10 +7,11 @@ def main():
     app.setStyle("Fusion")
 
     # ── dark palette ──────────────────────────────────────────
-    from gui.gui_utils import build_palette, pick_mono_font, APP_QSS
+    from gui.gui_utils import build_palette, pick_mono_font, APP_QSS, get_app_icon
     app.setPalette(build_palette())
     app.setFont(pick_mono_font(size=9))
     app.setStyleSheet(APP_QSS)
+    app.setWindowIcon(get_app_icon())
 
     # ── main window ───────────────────────────────────────────
     from primary.main_utils import MainWindow

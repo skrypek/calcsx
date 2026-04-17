@@ -716,7 +716,8 @@ class Workspace3DView(QWidget):
         self._event_filter: _GizmoEventFilter | None = None
         self._hint_label    = None
         self._stale_callback = None   # called when a coil is transformed after analysis
-        self._force_scalar_bar = None  # shared scalar bar for global force scale
+        self._force_scalar_bar = None      # shared scalar bar for global force scale
+        self._fieldline_scalar_bar = None  # shared scalar bar for field lines
         self._gizmo_target:  str = 'coil'   # 'coil' or 'probe'
         self._probe_entries: dict[str, dict] = {}  # probe_id → {position, xfm_params}
         self._active_probe_id: str | None = None
@@ -1534,12 +1535,8 @@ class Workspace3DView(QWidget):
     def add_force_layer(self, engine, coil_id: str, normalized: bool = False,
                          show_arrows: bool = False,
                          progress_callback=None) -> None:
-        """Render forces as a colour-gradient on the tape-stack mesh
-        (default) with optional arrow glyphs.
-
-        *progress_callback(pct)* is called during the heavy per-vertex
-        Biot-Savart loop so the caller can update a progress bar.
-        """
+        """Render forces as a color gradient on the tape-stack mesh
+        (default) with optional arrow glyphs."""
         if self._plotter is None:
             return
         name = 'Forces'
@@ -1570,15 +1567,16 @@ class Workspace3DView(QWidget):
             arr.SetName('force_mag')
             n_verts = mesh.GetNumberOfPoints()
             arr.SetNumberOfTuples(n_verts)
-            pts_np = np.array(mesh.points, dtype=np.float64)
 
             try:
                 n_peri = int(mesh.field_data['n_peri'][0])
             except Exception:
                 n_peri = 4
             n_cs = len(coords)
+            n_seg = len(mags)         # per-segment force magnitudes
             n_surf = n_cs * n_peri
 
+            pts_np = np.array(mesh.points, dtype=np.float64)
             tangents = np.empty_like(coords)
             tangents[1:-1] = coords[2:] - coords[:-2]
             tangents[0] = coords[1] - coords[0]
@@ -1586,11 +1584,13 @@ class Workspace3DView(QWidget):
             t_mag = np.linalg.norm(tangents, axis=1, keepdims=True).clip(1e-12)
             tangents /= t_mag
 
-            # Suppress VTK rendering during batch loop so processEvents
-            # (called by the progress callback) won't trigger a render
-            # on the partially-written mesh — avoids bus-error crashes.
+            # Suppress VTK rendering so processEvents can update the
+            # progress dialog without triggering a scene repaint.
+            # The scalar array is written to a detached vtkFloatArray
+            # and only committed to the mesh AFTER this loop.
+            from PyQt5.QtWidgets import QApplication as _QApp
             self._plotter.suppress_rendering = True
-            batch = 200
+            batch = 100
             n_batches = (n_verts + batch - 1) // batch
             for bi, start in enumerate(range(0, n_verts, batch)):
                 end = min(start + batch, n_verts)
@@ -1601,8 +1601,11 @@ class Workspace3DView(QWidget):
                     ci = min(vi // n_peri, n_cs - 1) if vi < n_surf else 0
                     F_vec = np.cross(tangents[ci], B_batch[vi - start])
                     arr.SetValue(vi, float(np.linalg.norm(F_vec)))
-                if progress_callback is not None:
-                    progress_callback(bi + 1, n_batches)
+                del B_batch
+                if bi % 5 == 0:
+                    if progress_callback is not None:
+                        progress_callback(bi + 1, n_batches)
+                    _QApp.processEvents()
             self._plotter.suppress_rendering = False
 
             mesh.GetPointData().SetScalars(arr)
@@ -1629,9 +1632,6 @@ class Workspace3DView(QWidget):
             mapper.SetLookupTable(mapper.GetLookupTable())
             mapper.ScalarVisibilityOn()
             tube_actor.GetProperty().SetOpacity(1.0)
-
-            # Do NOT create a scalar bar here — rescale_all_force_layers()
-            # creates one shared bar after all coils are processed.
 
         # ── Optional arrow glyphs ──
         if show_arrows:
@@ -1750,6 +1750,72 @@ class Workspace3DView(QWidget):
         self._reposition_scalar_bars()
         self._plotter.render()
 
+    def rescale_all_field_line_layers(self) -> None:
+        """Unify the color scale across all field line layers.
+
+        Same pattern as rescale_all_force_layers: single global range,
+        one shared scalar bar.
+        """
+        if self._plotter is None:
+            return
+
+        fl_actors = []
+        for (cid, lname), layer in self._layers.items():
+            if lname != 'Field Lines':
+                continue
+            for actor in layer.actors:
+                try:
+                    ds = actor.GetMapper().GetInput()
+                    if ds is None:
+                        continue
+                    mesh = pv.wrap(ds)
+                    if 'fl_log_B' not in mesh.point_data:
+                        continue
+                    fl_actors.append((actor, layer))
+                except Exception:
+                    pass
+
+        if not fl_actors:
+            if getattr(self, '_fieldline_scalar_bar', None) is not None:
+                try:
+                    self._plotter.renderer.RemoveActor2D(self._fieldline_scalar_bar)
+                except Exception:
+                    pass
+                self._fieldline_scalar_bar = None
+            return
+
+        # Global min/max of log|B|
+        g_min, g_max = float('inf'), float('-inf')
+        for actor, _ in fl_actors:
+            vals = np.asarray(pv.wrap(actor.GetMapper().GetInput()).point_data['fl_log_B'])
+            lo, hi = float(vals.min()), float(vals.max())
+            if lo < g_min:
+                g_min = lo
+            if hi > g_max:
+                g_max = hi
+        if g_max - g_min < 1e-30:
+            g_max = g_min + 1.0
+
+        for actor, layer in fl_actors:
+            actor.GetMapper().SetScalarRange(g_min, g_max)
+            layer.clim = (g_min, g_max)
+
+        sb = getattr(self, '_fieldline_scalar_bar', None)
+        if sb is None:
+            sb = self._make_scalar_bar(fl_actors[0][0], 'log\u2081\u2080|B| (T)')
+            self._fieldline_scalar_bar = sb
+        else:
+            try:
+                sb.SetLookupTable(fl_actors[0][0].GetMapper().GetLookupTable())
+            except Exception:
+                pass
+
+        for _, layer in fl_actors:
+            layer.scalar_bar = sb
+
+        self._reposition_scalar_bars()
+        self._plotter.render()
+
     def add_stress_layer(self, engine, coil_id: str) -> None:
         if self._plotter is None:
             return
@@ -1831,12 +1897,10 @@ class Workspace3DView(QWidget):
             line_width=1.2, show_scalar_bar=False,
             reset_camera=False, render=False,
         )
-        sb = self._make_scalar_bar(a, 'log\u2081\u2080|B| (T)')
         cmap_name = THEME.get('cmap_field', 'cool')
         self._layers[(coil_id, name)] = _Layer(
-            name, [a], scalar_bar=sb, cmap=cmap_name, scalars_name='fl_log_B',
+            name, [a], cmap=cmap_name, scalars_name='fl_log_B',
         )
-        self._reposition_scalar_bars()
         self._plotter.render()
 
     def add_cross_section_layer(
@@ -1886,20 +1950,25 @@ class Workspace3DView(QWidget):
         for actor in layer.actors:
             _set_visible(actor, visible)
         if layer.scalar_bar is not None:
-            # For the shared force bar: show if ANY Forces layer is visible
-            shared = getattr(self, '_force_scalar_bar', None)
-            if shared is not None and layer.scalar_bar is shared:
-                any_vis = any(
-                    l.visible for (_, ln), l in self._layers.items()
-                    if ln == 'Forces'
-                )
+            # For shared bars: show if ANY layer of the same type is visible
+            sb = layer.scalar_bar
+            is_shared = False
+            for attr, ltype in (('_force_scalar_bar', 'Forces'),
+                                ('_fieldline_scalar_bar', 'Field Lines')):
+                if getattr(self, attr, None) is sb:
+                    any_vis = any(
+                        l.visible for (_, ln), l in self._layers.items()
+                        if ln == ltype
+                    )
+                    try:
+                        sb.SetVisibility(int(any_vis))
+                    except Exception:
+                        pass
+                    is_shared = True
+                    break
+            if not is_shared:
                 try:
-                    shared.SetVisibility(int(any_vis))
-                except Exception:
-                    pass
-            else:
-                try:
-                    layer.scalar_bar.SetVisibility(int(visible))
+                    sb.SetVisibility(int(visible))
                 except Exception:
                     pass
         # Force layer: the tube actor belongs to the coil entry,
@@ -2109,25 +2178,29 @@ class Workspace3DView(QWidget):
                 except Exception:
                     pass
         if layer.scalar_bar is not None:
-            # For the shared force scalar bar, only remove it from the
-            # renderer if no other Forces layer still references it.
-            shared = getattr(self, '_force_scalar_bar', None)
-            is_shared = (shared is not None and layer.scalar_bar is shared)
-            other_force_layers = any(
-                l.scalar_bar is shared
+            # For shared scalar bars (forces, field lines), only remove
+            # from the renderer if no other layer still references it.
+            sb = layer.scalar_bar
+            shared_attr = None
+            for attr in ('_force_scalar_bar', '_fieldline_scalar_bar'):
+                if getattr(self, attr, None) is sb:
+                    shared_attr = attr
+                    break
+            others_use_it = any(
+                l.scalar_bar is sb
                 for k, l in self._layers.items()
-                if k != key and l.scalar_bar is shared
-            ) if is_shared else False
-            if not other_force_layers:
+                if k != key and l.scalar_bar is sb
+            ) if shared_attr else False
+            if not others_use_it:
                 try:
-                    self._plotter.renderer.RemoveActor2D(layer.scalar_bar)
+                    self._plotter.renderer.RemoveActor2D(sb)
                 except Exception:
                     try:
-                        self._plotter.remove_actor(layer.scalar_bar, render=False)
+                        self._plotter.remove_actor(sb, render=False)
                     except Exception:
                         pass
-                if is_shared:
-                    self._force_scalar_bar = None
+                if shared_attr:
+                    setattr(self, shared_attr, None)
         del self._layers[key]
 
     def _make_scalar_bar(self, mesh_actor, title: str) -> object:
@@ -2233,10 +2306,13 @@ class Workspace3DView(QWidget):
         if path:
             self._plotter.screenshot(path)
 
-    # ── glTF per-layer export (Dev Settings) ──────────────────────────────────
+    def export_vtk_layers(self, output_dir: str) -> list[str]:
+        """Export coil geometry and analysis data as VTK PolyData (.vtp)
+        files for ParaView.
 
-    def export_layers_gltf(self, output_dir: str) -> list[str]:
-        """Export each coil geometry and analysis layer as a separate .gltf file.
+        Unlike glTF export, VTK files preserve raw scalar arrays
+        (force_mag, stress_MPa, B_mag, etc.) so ParaView can apply
+        its own colormaps and post-processing.
 
         Returns list of exported file paths.
         """
@@ -2250,8 +2326,8 @@ class Workspace3DView(QWidget):
         def _sanitize(name: str) -> str:
             return name.replace(' ', '_').replace('/', '_').lower()
 
-        def _apply_world_transform(mesh, actor):
-            """Bake the actor's UserTransform into mesh points (world coords)."""
+        def _world_transform(mesh, actor):
+            """Bake the actor's UserTransform into mesh points."""
             xfm = actor.GetUserTransform()
             if xfm is not None:
                 mat = np.zeros((4, 4), dtype=np.float64)
@@ -2262,126 +2338,67 @@ class Workspace3DView(QWidget):
                 transformed = homo @ mat.T
                 mesh.points = transformed[:, :3].astype(np.float32)
 
-        def _solidify(mesh):
-            """Convert line or point primitives to surface geometry so glTF
-            can carry vertex colors.  Returns a new mesh with faces, or the
-            original mesh if it already has faces.
-            Non-PolyData types (StructuredGrid, UnstructuredGrid) already have
-            surface cells and pass through unchanged."""
-            if not isinstance(mesh, pv.PolyData):
-                return mesh
-            faces = getattr(mesh, 'faces', None)
-            lines = getattr(mesh, 'lines', None)
-            has_faces = faces is not None and len(faces) > 0
-            has_lines = lines is not None and len(lines) > 0
-            if not has_faces and has_lines:
-                try:
-                    bbox = float(_ptp(np.asarray(mesh.points), axis=0).max())
-                    tube = mesh.tube(radius=bbox * 0.0005, n_sides=6)
-                    if tube.n_points > 0:
-                        return tube
-                except Exception:
-                    pass
-            if not has_faces and not has_lines:
-                try:
-                    bbox = float(_ptp(np.asarray(mesh.points), axis=0).max())
-                    sphere = pv.Sphere(radius=bbox * 0.001,
-                                       theta_resolution=6, phi_resolution=6)
-                    glyphed = mesh.glyph(geom=sphere, scale=False)
-                    if glyphed.n_points > 0:
-                        return glyphed
-                except Exception:
-                    pass
-            return mesh
-
-        def _extract_mesh(actor):
-            """Pull the displayable mesh out of a VTK actor with world-space
-            coordinates.  Converts lines/points to surface geometry."""
-            try:
-                mapper = actor.GetMapper()
-                if mapper is None:
-                    return None
-                ds = mapper.GetInput()
-                if ds is None:
-                    return None
-                mesh = pv.wrap(ds).copy()
-                if mesh.n_points == 0:
-                    return None
-                mesh = _solidify(mesh)
-                _apply_world_transform(mesh, actor)
-                return mesh
-            except Exception:
-                return None
-
-        def _actor_solid_color(actor):
-            """Return the actor's solid color as an (R, G, B) uint8 tuple, or None."""
-            try:
-                prop = actor.GetProperty()
-                r, g, b = prop.GetColor()
-                return (int(r * 255), int(g * 255), int(b * 255))
-            except Exception:
-                return None
-
-        def _export_mesh(mesh, filepath, solid_color=None, opacity=1.0,
-                         cmap_name='', scalars_name='', clim=None):
-            """Write a single mesh to a .gltf file using an offscreen plotter.
-            Pass cmap_name/scalars_name/clim for colormapped layers so the
-            offscreen plotter applies the correct THEME colormap."""
-            try:
-                p = pv.Plotter(off_screen=True)
-                kwargs = dict(reset_camera=True)
-                if cmap_name and scalars_name and scalars_name in mesh.point_data:
-                    kwargs['scalars'] = scalars_name
-                    kwargs['cmap'] = cmap_name
-                    if clim is not None:
-                        kwargs['clim'] = list(clim)
-                elif solid_color is not None:
-                    kwargs['color'] = solid_color
-                kwargs['opacity'] = opacity
-                p.add_mesh(mesh, **kwargs)
-                p.export_gltf(filepath)
-                p.close()
-                return True
-            except Exception:
-                return False
-
-        # Export coil geometry meshes
+        # ── Coil geometry ──
         for coil_id, entry in self._coil_entries.items():
             for i, actor in enumerate(entry['actors']):
-                mesh = _extract_mesh(actor)
-                if mesh is None:
-                    continue
-                color = _actor_solid_color(actor) or entry.get('color')
                 try:
-                    opacity = actor.GetProperty().GetOpacity()
-                except Exception:
-                    opacity = 1.0
-                suffix = 'tube' if i == 0 else 'wire'
-                fname = f"coil_{_sanitize(coil_id)}_{suffix}.gltf"
-                fpath = os.path.join(output_dir, fname)
-                if _export_mesh(mesh, fpath, solid_color=color, opacity=opacity):
+                    ds = actor.GetMapper().GetInput()
+                    if ds is None:
+                        continue
+                    mesh = pv.wrap(ds).copy()
+                    if mesh.n_points == 0:
+                        continue
+                    _world_transform(mesh, actor)
+                    suffix = 'tube' if i == 0 else 'wire'
+                    fpath = os.path.join(
+                        output_dir, f"coil_{_sanitize(coil_id)}_{suffix}.vtp")
+                    mesh.save(fpath)
                     exported.append(fpath)
+                except Exception:
+                    pass
 
-        # Export analysis layers — pass the THEME colormap so the offscreen
-        # plotter maps scalars with the correct colours for the active theme.
+        # ── Analysis layers ──
         for (coil_id, layer_name), layer in self._layers.items():
             for actor in layer.actors:
-                mesh = _extract_mesh(actor)
-                if mesh is None:
-                    continue
-                color = _actor_solid_color(actor)
                 try:
-                    opacity = actor.GetProperty().GetOpacity()
-                except Exception:
-                    opacity = 1.0
-                cid_part = _sanitize(coil_id) if coil_id != '__global__' else 'global'
-                fname = f"{cid_part}_{_sanitize(layer_name)}.gltf"
-                fpath = os.path.join(output_dir, fname)
-                if _export_mesh(mesh, fpath, solid_color=color, opacity=opacity,
-                                cmap_name=layer.cmap,
-                                scalars_name=layer.scalars_name,
-                                clim=layer.clim):
+                    ds = actor.GetMapper().GetInput()
+                    if ds is None:
+                        continue
+                    mesh = pv.wrap(ds).copy()
+                    if mesh.n_points == 0:
+                        continue
+                    _world_transform(mesh, actor)
+                    cid = _sanitize(coil_id) if coil_id != '__global__' else 'global'
+                    fpath = os.path.join(
+                        output_dir, f"{cid}_{_sanitize(layer_name)}.vtp")
+                    mesh.save(fpath)
                     exported.append(fpath)
+                except Exception:
+                    pass
+
+        # ── Coil tube meshes with force scalars baked in ──
+        # The tube actor's force_mag array lives on the coil entry, not
+        # the Forces layer.  Export it as a dedicated file so ParaView
+        # gets the colored tube directly.
+        for (coil_id, layer_name), layer in self._layers.items():
+            if layer_name != 'Forces':
+                continue
+            entry = self._coil_entries.get(coil_id)
+            if entry is None or not entry.get('actors'):
+                continue
+            tube_actor = entry['actors'][0]
+            try:
+                ds = tube_actor.GetMapper().GetInput()
+                mesh = pv.wrap(ds).copy()
+                if mesh.n_points == 0:
+                    continue
+                _world_transform(mesh, tube_actor)
+                fpath = os.path.join(
+                    output_dir, f"coil_{_sanitize(coil_id)}_forces.vtp")
+                mesh.save(fpath)
+                exported.append(fpath)
+            except Exception:
+                pass
 
         return exported
 
