@@ -32,3 +32,15 @@ resources     = ["CalcSX_app/resources"]
 icon          = "CalcSX_app/resources/images/app"
 
 entry_point = "CalcSX_app.main:main"
+
+[tool.briefcase.app.CalcSX_app.document_type.csx]
+description = "CalcSX Coil File"
+extension   = "csx"
+icon        = "CalcSX_app/resources/images/csx"
+url         = "https://calc.sx/csx"
+
+[tool.briefcase.app.CalcSX_app.document_type.bobsx]
+description = "CalcSX Bobbin File"
+extension   = "bobsx"
+icon        = "CalcSX_app/resources/images/bobsx"
+url         = "https://calc.sx/bobsx"
