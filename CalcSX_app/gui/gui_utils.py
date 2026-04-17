@@ -1,15 +1,11 @@
 # gui_utils.py
-import matplotlib.pyplot as plt
-from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
-from PyQt5.QtGui import QPainter, QPixmap, QPalette, QColor, QFont, QFontDatabase
+from PyQt5.QtCore import Qt, QTimer, QObject
+from PyQt5.QtGui import QPalette, QColor, QFont, QFontDatabase
 import random
 import time
 from PyQt5.QtWidgets import (
     QProgressDialog, QApplication, QLabel,
-    QHBoxLayout, QPushButton, QVBoxLayout, QWidget, QFileDialog, QSizePolicy,
 )
-from pathlib import Path
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 
 # ─────────────────────────────────────────────────────────────
 # Colour palette (single source of truth for all modules)
@@ -47,6 +43,8 @@ _DARK_THEME = {
     'lyr_baxis':     '#80d8ff',
     'lyr_fieldlines':'#80ffff',
     'lyr_xsection':  '#ff9800',
+    'lyr_probe':     '#e040fb',   # hall probe (purple)
+    'probe_readout': '#00e5ff',   # probe readout accent (cyan)
     # Coil colour cycle
     'coil_colors':   ['#4dd0e1','#ff6b6b','#ffd93d','#6bcb77','#4d96ff','#c77dff'],
     'mode':          'dark',
@@ -85,6 +83,8 @@ _LIGHT_THEME = {
     'lyr_baxis':     '#2070a0',
     'lyr_fieldlines':'#0d7377',
     'lyr_xsection':  '#c06000',
+    'lyr_probe':     '#7b1fa2',   # hall probe (dark purple)
+    'probe_readout': '#006064',   # probe readout accent (teal)
     # Coil colour cycle (deeper tones for light bg)
     'coil_colors':   ['#21918c','#c62828','#f9a825','#2e7d32','#1565c0','#7b1fa2'],
     'mode':          'light',
@@ -140,9 +140,6 @@ def build_palette() -> QPalette:
     p.setColor(QPalette.Disabled, QPalette.WindowText,  dim)
     return p
 
-# Backward-compatible alias
-build_dark_palette = build_palette
-
 
 def pick_mono_font(size: int = 9) -> QFont:
     """Return the best available monospace font for the terminal aesthetic."""
@@ -158,32 +155,6 @@ def pick_mono_font(size: int = 9) -> QFont:
     f.setStyleHint(QFont.Monospace)
     f.setPointSize(size)
     return f
-
-
-def apply_mpl_dark_theme() -> None:
-    """Set matplotlib rcParams to match the dark THEME.  Call once at startup."""
-    plt.rcParams.update({
-        'figure.facecolor':   THEME['bg'],
-        'axes.facecolor':     THEME['panel'],
-        'axes.edgecolor':     THEME['border'],
-        'axes.labelcolor':    THEME['text'],
-        'axes.titlecolor':    THEME['text'],
-        'text.color':         THEME['text'],
-        'xtick.color':        THEME['text'],
-        'ytick.color':        THEME['text'],
-        'grid.color':         THEME['input'],
-        'grid.linestyle':     '--',
-        'grid.alpha':         0.45,
-        'legend.facecolor':   THEME['panel'],
-        'legend.edgecolor':   THEME['border'],
-        'legend.labelcolor':  THEME['text'],
-        'font.family':        'monospace',
-        'axes.prop_cycle':    plt.cycler(color=[
-            THEME['accent'], THEME['accent2'],
-            THEME['success'], THEME['warning'],
-        ]),
-        'lines.linewidth':    1.6,
-    })
 
 
 def build_app_qss() -> str:
@@ -329,323 +300,6 @@ def apply_theme_to_app(name: str) -> None:
         app.setStyleSheet(APP_QSS)
 
 
-# ─────────────────────────────────────────────────────────────
-# Canvas helpers
-# ─────────────────────────────────────────────────────────────
-
-# load and cache the watermark pixmap once (deferred until QApplication exists)
-_LOGO_PATH = Path(__file__).parent.parent / "resources" / "images" / "powered_by.png"
-_WATERMARK_PM = None
-
-def _get_watermark_pm():
-    global _WATERMARK_PM
-    if _WATERMARK_PM is None:
-        _WATERMARK_PM = QPixmap(str(_LOGO_PATH))
-    return _WATERMARK_PM
-
-
-class WatermarkedCanvas(FigureCanvasQTAgg):
-    """
-    FigureCanvas that overlays a transparent watermark pixmap in paintEvent,
-    after Matplotlib has rendered.  Preserves 3D view state during repaints.
-    """
-
-    def __init__(self, figure, zoom=0.10, pad=0.02, alpha=0.35):
-        super().__init__(figure)
-        self._zoom  = zoom
-        self._pad   = pad
-        self._alpha = alpha
-        self._3d_view_state = {}
-        self._store_3d_view_state()
-
-    def _store_3d_view_state(self):
-        self._3d_view_state = {}
-        for i, ax in enumerate(self.figure.get_axes()):
-            if hasattr(ax, 'zaxis'):
-                self._3d_view_state[i] = {
-                    'elev': ax.elev, 'azim': ax.azim,
-                    'xlim': ax.get_xlim(), 'ylim': ax.get_ylim(), 'zlim': ax.get_zlim(),
-                }
-
-    def _restore_3d_view_state(self):
-        for i, ax in enumerate(self.figure.get_axes()):
-            if hasattr(ax, 'zaxis') and i in self._3d_view_state:
-                s = self._3d_view_state[i]
-                ax.view_init(elev=s['elev'], azim=s['azim'])
-                ax.set_xlim(s['xlim']); ax.set_ylim(s['ylim']); ax.set_zlim(s['zlim'])
-
-    def paintEvent(self, event):
-        self._store_3d_view_state()
-        super().paintEvent(event)
-        self._restore_3d_view_state()
-
-        painter = QPainter(self)
-        painter.setOpacity(self._alpha)
-        w, h = self.width(), self.height()
-        target_w = int(w * self._zoom)
-        scaled = _get_watermark_pm().scaledToWidth(target_w, Qt.SmoothTransformation)
-        pad_x, pad_y = int(w * self._pad), int(h * self._pad)
-        painter.drawPixmap(w - scaled.width() - pad_x, h - scaled.height() - pad_y, scaled)
-        painter.end()
-
-    def mousePressEvent(self, e):   super().mousePressEvent(e);   self._store_3d_view_state()
-    def mouseReleaseEvent(self, e): super().mouseReleaseEvent(e); self._store_3d_view_state()
-
-    def wheelEvent(self, event):
-        """Scroll-wheel zoom for both 2-D and 3-D axes."""
-        delta = event.angleDelta().y()
-        if delta == 0:
-            super().wheelEvent(event)
-            self._store_3d_view_state()
-            return
-
-        # ── 3-D axes: scale all three limits around their centre ──────────────
-        for ax in self.figure.get_axes():
-            if not hasattr(ax, 'zaxis'):
-                continue
-            factor = 0.85 if delta > 0 else 1.18   # zoom-in / zoom-out
-            for get_lim, set_lim in [
-                (ax.get_xlim, ax.set_xlim),
-                (ax.get_ylim, ax.set_ylim),
-                (ax.get_zlim, ax.set_zlim),
-            ]:
-                lo, hi = get_lim()
-                mid  = (lo + hi) / 2
-                half = (hi - lo) / 2 * factor
-                set_lim(mid - half, mid + half)
-            self.draw_idle()
-            self._store_3d_view_state()
-            return
-
-        # ── 2-D axes: zoom around cursor position ─────────────────────────────
-        factor = 0.80 if delta > 0 else 1.25
-        fx = event.x() / max(self.width(),  1)
-        fy = 1.0 - event.y() / max(self.height(), 1)
-
-        zoomed = False
-        for ax in self.figure.get_axes():
-            if hasattr(ax, 'zaxis'):
-                continue
-            bb = ax.get_position()
-            if not (bb.x0 <= fx <= bb.x1 and bb.y0 <= fy <= bb.y1):
-                continue
-            ax_x = (fx - bb.x0) / max(bb.width,  1e-9)
-            ax_y = (fy - bb.y0) / max(bb.height, 1e-9)
-            xlo, xhi = ax.get_xlim()
-            ylo, yhi = ax.get_ylim()
-            mx = xlo + ax_x * (xhi - xlo)
-            my = ylo + ax_y * (yhi - ylo)
-            ax.set_xlim(mx + (xlo - mx) * factor, mx + (xhi - mx) * factor)
-            ax.set_ylim(my + (ylo - my) * factor, my + (yhi - my) * factor)
-            zoomed = True
-
-        if zoomed:
-            self.draw_idle()
-        else:
-            super().wheelEvent(event)
-
-        self._store_3d_view_state()
-
-    def save_image(self, parent=None):
-        """Open a save-file dialog and export the figure."""
-        path, _ = QFileDialog.getSaveFileName(
-            parent, "Save Plot", "calcsx_plot.png",
-            "PNG image (*.png);;PDF (*.pdf);;SVG (*.svg)",
-        )
-        if path:
-            self.figure.savefig(path, dpi=150, bbox_inches='tight',
-                                facecolor=self.figure.get_facecolor())
-
-    def set_grid(self, on: bool):
-        """Show or hide grid on all axes (2-D and 3-D)."""
-        for ax in self.figure.get_axes():
-            ax.grid(on)
-        self.draw_idle()
-
-    def reset_zoom(self):
-        """Autoscale all axes back to data extents."""
-        for ax in self.figure.get_axes():
-            ax.autoscale()
-        self.draw_idle()
-
-
-# ─────────────────────────────────────────────────────────────
-# Thin toolbar that wraps any WatermarkedCanvas
-# ─────────────────────────────────────────────────────────────
-
-class PlotToolbar(QWidget):
-    """
-    A slim button bar to attach below (or above) any WatermarkedCanvas.
-    Provides: Reset Zoom | Grid on/off | Save Image
-    """
-
-    _BTN_STYLE = (
-        f"QPushButton {{"
-        f"  background:{THEME['panel']}; border:1px solid {THEME['border']};"
-        f"  border-radius:3px; padding:2px 8px; color:{THEME['text_dim']};"
-        f"  font-size:8pt;"
-        f"}}"
-        f"QPushButton:hover {{"
-        f"  background:{THEME['input']}; border-color:{THEME['accent']};"
-        f"  color:{THEME['text']};"
-        f"}}"
-        f"QPushButton:checked {{"
-        f"  background:{THEME['hi_blue']}; color:{THEME['text']};"
-        f"  border-color:{THEME['accent']};"
-        f"}}"
-    )
-
-    def __init__(self, canvas: 'WatermarkedCanvas', parent=None):
-        super().__init__(parent)
-        self._canvas = canvas
-        has_3d = any(hasattr(ax, 'zaxis') for ax in canvas.figure.get_axes())
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(4, 2, 4, 2)
-        lay.setSpacing(4)
-        lay.addStretch()
-
-        # Zoom reset only meaningful on 2-D axes (3-D uses orbital drag)
-        if not has_3d:
-            btn_zoom = QPushButton("⌖ Reset Zoom")
-            btn_zoom.setStyleSheet(self._BTN_STYLE)
-            btn_zoom.clicked.connect(canvas.reset_zoom)
-            lay.addWidget(btn_zoom)
-
-        self._btn_grid = QPushButton("⊞ Grid")
-        self._btn_grid.setCheckable(True)
-        self._btn_grid.setChecked(True)
-        self._btn_grid.setStyleSheet(self._BTN_STYLE)
-        self._btn_grid.toggled.connect(canvas.set_grid)
-        lay.addWidget(self._btn_grid)
-
-        btn_save = QPushButton("💾 Save")
-        btn_save.setStyleSheet(self._BTN_STYLE)
-        btn_save.clicked.connect(lambda: canvas.save_image(self))
-        lay.addWidget(btn_save)
-
-
-
-# ─────────────────────────────────────────────────────────────
-# View-switcher bar  (replaces QTabWidget in ResultsPage)
-# ─────────────────────────────────────────────────────────────
-
-class ViewSwitcherBar(QWidget):
-    """
-    Horizontal flat-tab / segmented-control bar for switching named views.
-    Active button: THEME['bg'] background + THEME['accent'] 2 px bottom border.
-    Inactive button: THEME['panel'] background, dim text, hover lightens.
-    Emits view_changed(int) when the active view changes.
-    """
-    view_changed = pyqtSignal(int)
-
-    def __init__(self, labels: list, parent=None):
-        super().__init__(parent)
-        self._buttons: list = []
-        self.setFixedHeight(36)
-        self.setStyleSheet(f"background:{THEME['panel']};")
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        for i, label in enumerate(labels):
-            btn = QPushButton(label)
-            btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
-            btn.setFixedHeight(36)
-            btn.clicked.connect(lambda _, idx=i: self._activate(idx))
-            self._buttons.append(btn)
-            lay.addWidget(btn)
-
-        lay.addStretch(1)
-
-        if self._buttons:
-            self._activate(0)
-
-    def _activate(self, idx: int):
-        for i, btn in enumerate(self._buttons):
-            if i == idx:
-                btn.setStyleSheet(
-                    f"QPushButton {{"
-                    f" background:{THEME['bg']};"
-                    f" color:{THEME['text']};"
-                    f" border:none;"
-                    f" border-bottom:2px solid {THEME['accent']};"
-                    f" padding:0 20px;"
-                    f" font-size:9pt;"
-                    f" font-weight:600;"
-                    f"}}"
-                )
-            else:
-                btn.setStyleSheet(
-                    f"QPushButton {{"
-                    f" background:{THEME['panel']};"
-                    f" color:{THEME['text_dim']};"
-                    f" border:none;"
-                    f" border-bottom:2px solid transparent;"
-                    f" padding:0 20px;"
-                    f" font-size:9pt;"
-                    f"}}"
-                    f"QPushButton:hover {{"
-                    f" color:{THEME['text']};"
-                    f" background:{THEME['input']};"
-                    f"}}"
-                )
-        self.view_changed.emit(idx)
-
-    def activate(self, idx: int):
-        """Programmatically switch to view idx without re-emitting if already active."""
-        self._activate(idx)
-
-
-def make_canvas_with_toolbar(plot_fn, ctx, figsize=(8, 6),
-                              projection=None) -> QWidget:
-    """
-    Returns a QWidget containing a WatermarkedCanvas above a PlotToolbar.
-    Drop-in replacement for make_canvas() when toolbar controls are desired.
-    """
-    canvas = make_canvas(plot_fn, ctx, figsize=figsize, projection=projection)
-    wrapper = QWidget()
-    lay = QVBoxLayout(wrapper)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(0)
-    lay.addWidget(canvas, stretch=1)
-    lay.addWidget(PlotToolbar(canvas))
-    return wrapper
-
-
-def make_canvas(plot_fn, ctx, figsize=(8, 6), projection=None) -> WatermarkedCanvas:
-    """Create a WatermarkedCanvas with the dark background already applied."""
-    fig = plt.figure(figsize=figsize, facecolor=THEME['bg'])
-    if projection:
-        ax = fig.add_subplot(111, projection=projection)
-    else:
-        ax = fig.add_subplot(111)
-    plot_fn(ax, ctx)
-    plt.close(fig)
-    canvas = WatermarkedCanvas(fig)
-    canvas._store_3d_view_state()
-    return canvas
-
-
-# ─────────────────────────────────────────────────────────────
-# Logo mixin (kept for backward compat; now also used by ParameterPanel)
-# ─────────────────────────────────────────────────────────────
-
-class LogoMixin:
-    def __init__(self, logo_path, logo_pct=0.2, margin=10):
-        self._logo_path = logo_path
-        self._logo_pct  = logo_pct
-        self._margin    = margin
-
-    def paint_logo(self, painter, widget):
-        pix = QPixmap(self._logo_path)
-        if pix.isNull():
-            return
-        tw = int(widget.width() * self._logo_pct)
-        scaled = pix.scaledToWidth(tw, Qt.SmoothTransformation)
-        painter.drawPixmap(self._margin, self._margin, scaled)
-
 
 # ─────────────────────────────────────────────────────────────
 # Progress reporter
@@ -708,6 +362,7 @@ class ProgressReporter(QObject):
         self._stage_text   = ""
         self._dot_index    = 0
         self._booting      = True
+        self.dlg.setRange(0, 100)
         self.dlg.setValue(0)
         self._update_label()
         self.dlg.show()

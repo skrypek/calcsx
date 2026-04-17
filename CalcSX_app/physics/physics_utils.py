@@ -4,7 +4,7 @@ from sklearn.decomposition import PCA
 
 class CoilAnalysis:
     def __init__(self, coords, winds, current, thickness_microns, tape_width_mm,
-                 B_ext=None):
+                 B_ext=None, tape_normals=None):
         # raw inputs
         self.compute_bfield_enabled = False
         self.coords = coords
@@ -14,6 +14,9 @@ class CoilAnalysis:
         # Callable[[ndarray], ndarray]: points (M,3) → B (M,3) from other coils.
         # None means single-coil mode (no external contributions).
         self._B_ext = B_ext
+        # Supplied tape-face normals from bobbin geometry.
+        # (n, 3) array — if provided, used instead of Frenet-Serret inference.
+        self._supplied_tape_normals = tape_normals
         # convert units (meters and total thickness)
         self.thickness = thickness_microns * 1e-6 # m per turn
         self.total_thickness = self.thickness * winds # total coil thickness
@@ -48,6 +51,9 @@ class CoilAnalysis:
         self._fil_weights = None
         self._fil_dl      = None
         self._fil_mid     = None
+        # Inductance (populated post-analysis)
+        self.self_inductance = None   # H
+        self.stored_energy   = None   # J
 
 
     def run_analysis(self, compute_bfield=False, use_gauss=False,
@@ -99,6 +105,10 @@ class CoilAnalysis:
         _stage("Lorentz force integration")
         n = len(self.coords) - 1
         self.F_vecs = np.zeros((n, 3), dtype=float)
+        # Per-sub-filament force magnitudes for radial gradient viz
+        n_fil = getattr(self, '_n_fil', 1)
+        if n_fil > 1:
+            self._fil_F_mags = [np.zeros(n, dtype=float) for _ in range(n_fil)]
         is_planar = getattr(self, "is_planar", False)
         if is_planar and self.seg_len is None:
             self._compute_arc()
@@ -134,6 +144,17 @@ class CoilAnalysis:
                 self.F_vecs[i1] = self.F_vecs[i2] = avg
             avg0 = 0.5 * (self.F_vecs[0] + self.F_vecs[-1])
             self.F_vecs[0] = self.F_vecs[-1] = avg0
+
+        # Quick spike check (log only if anomalous)
+        _F_mags_dbg = np.linalg.norm(self.F_vecs, axis=1)
+        _med = float(np.median(_F_mags_dbg)) if n > 0 else 0
+        _max_ratio = float(np.max(_F_mags_dbg) / _med) if _med > 0 else 0
+        if _max_ratio > 5:
+            import logging as _lg
+            _top = int(np.argmax(_F_mags_dbg))
+            _lg.warning(f"Force spike: seg {_top} |F|={_F_mags_dbg[_top]:.4e} "
+                         f"({_max_ratio:.1f}x median={_med:.4e}) "
+                         f"n_fil={getattr(self,'_n_fil',1)}")
 
         # 4.1) Convert force to density
         self.F_seg_mags = np.linalg.norm(self.F_vecs, axis=1)
@@ -175,7 +196,16 @@ class CoilAnalysis:
         if progress_callback:
             progress_callback(97)
 
-        # 8) Done -> 100%
+        # 8) Self-inductance & stored energy -> 98%
+        _stage("Self-inductance")
+        try:
+            self._compute_self_inductance()
+        except Exception:
+            pass
+        if progress_callback:
+            progress_callback(98)
+
+        # 9) Done -> 100%
         _stage("Finalizing")
         if progress_callback:
             progress_callback(100)
@@ -188,7 +218,8 @@ class CoilAnalysis:
 
     @staticmethod
     def _bfield_from_source(points, source_coords, current, winds,
-                             skip_index=None, core_radius=1e-4):
+                             skip_index=None, core_radius=1e-4,
+                             skip_neighbors=0):
         """
         Stateless vectorized Biot-Savart kernel.
 
@@ -199,6 +230,7 @@ class CoilAnalysis:
         current, winds: scalar electrical parameters
         skip_index   : int or None — segment to zero out
         core_radius  : regularisation radius
+        skip_neighbors : int — also skip this many segments on each side
 
         Returns (M, 3) B-field array.
         """
@@ -210,12 +242,17 @@ class CoilAnalysis:
 
         dl  = source_coords[1:] - source_coords[:-1]          # (n, 3)
         mid = 0.5 * (source_coords[:-1] + source_coords[1:])  # (n, 3)
+        nseg = len(dl)
 
         r  = points[:, None, :] - mid[None, :, :]             # (M, n, 3)
         r2 = np.einsum('mni,mni->mn', r, r)                    # (M, n)
 
         if skip_index is not None:
-            r2[:, int(skip_index)] = np.inf
+            si = int(skip_index)
+            for off in range(skip_neighbors + 1):
+                for idx in (si - off, si + off):
+                    if 0 <= idx < nseg:
+                        r2[:, idx] = np.inf
 
         denom = (r2 + a2) ** 1.5
         valid = np.isfinite(denom) & (denom > 0.0)
@@ -226,20 +263,23 @@ class CoilAnalysis:
         B *= 1e-7 * I * N
         return B
 
-    def _bfield_vec(self, points, skip_index=None, core_radius=1e-4):
+    def _bfield_vec(self, points, skip_index=None, core_radius=1e-4,
+                     skip_neighbors=0):
         """
         Vectorized Biot-Savart law for one or more observation points.
 
         points : array-like, shape (3,) or (M, 3)
         skip_index : int or None — segment index whose contribution is zeroed
         core_radius : float — regularisation radius (m) to avoid singularities
+        skip_neighbors : int — also skip this many segments on each side of skip_index
 
         Returns B with the same leading shape as points: (3,) or (M, 3).
         """
         single = (np.ndim(points) == 1)
         pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
         B = self._bfield_from_source(pts, self.coords, self.current, self.winds,
-                                      skip_index=skip_index, core_radius=core_radius)
+                                      skip_index=skip_index, core_radius=core_radius,
+                                      skip_neighbors=skip_neighbors)
         return B[0] if single else B
 
     def _bfield_vec_planar(self, points, skip_index=None, core_radius=None, skip_neighbors=2):
@@ -362,24 +402,49 @@ class CoilAnalysis:
         wts_2d = np.outer(r_wts, a_wts).ravel()
         wts_2d /= wts_2d.sum()
 
-        # Local frame per vertex: e_r (radial outward), e_ax (PCA axis)
-        e_ax = self.axis / (np.linalg.norm(self.axis) + 1e-30)
+        # Local frame per vertex: e_r (radial/normal) and e_w (width direction)
+        #
+        #   e_r  = tape normal — height of the stack grows along this.
+        #          Priority: supplied bobbin normals > Frenet > PCA radial.
+        #   e_w  = perpendicular to both the path tangent and e_r.
+        #          Width of the tape grows symmetrically along this.
 
-        # Radial direction at each vertex (perpendicular to axis, outward from mean)
-        dx = self.coords - self.mean_point                       # (n+1, 3)
-        proj = np.einsum('ij,j->i', dx, e_ax)[:, None] * e_ax   # axial component
-        radial = dx - proj                                        # (n+1, 3)
-        r_mag  = np.linalg.norm(radial, axis=1, keepdims=True).clip(1e-10)
-        e_r    = radial / r_mag                                   # (n+1, 3)
+        if (self._supplied_tape_normals is not None
+                and len(self._supplied_tape_normals) == len(self.coords)):
+            e_r = np.asarray(self._supplied_tape_normals, dtype=np.float64)
+            r_mag = np.linalg.norm(e_r, axis=1, keepdims=True).clip(1e-10)
+            e_r = e_r / r_mag
+        else:
+            # Fallback: PCA-based radial direction
+            e_ax_g = self.axis / (np.linalg.norm(self.axis) + 1e-30)
+            dx = self.coords - self.mean_point
+            proj = np.einsum('ij,j->i', dx, e_ax_g)[:, None] * e_ax_g
+            radial = dx - proj
+            r_mag = np.linalg.norm(radial, axis=1, keepdims=True).clip(1e-10)
+            e_r = radial / r_mag
+
+        # Tangent at each vertex (forward difference, wrap for closed coil)
+        tangent = np.empty_like(self.coords)
+        tangent[:-1] = self.coords[1:] - self.coords[:-1]
+        tangent[-1] = tangent[-2] if len(tangent) > 1 else np.array([1, 0, 0])
+        t_mag = np.linalg.norm(tangent, axis=1, keepdims=True).clip(1e-10)
+        e_t = tangent / t_mag
+
+        # Width direction: perpendicular to both tangent and radial
+        e_w = np.cross(e_t, e_r)
+        w_mag = np.linalg.norm(e_w, axis=1, keepdims=True).clip(1e-10)
+        e_w = e_w / w_mag
 
         # Build offset paths for each (r_j, a_k) quadrature point
+        #   r_phys offsets along e_r  (radial / height of stack)
+        #   a_phys offsets along e_w  (width of tape)
         n_fil = n_r * n_a
         fil_coords  = []
         fil_dl      = []
         fil_mid     = []
         for j in range(n_r):
             for k in range(n_a):
-                offset = r_phys[j] * e_r + a_phys[k] * e_ax      # (n+1, 3)
+                offset = r_phys[j] * e_r + a_phys[k] * e_w       # (n+1, 3)
                 fc = self.coords + offset                          # (n+1, 3)
                 fc = np.ascontiguousarray(fc, dtype=np.float64)
                 fil_coords.append(fc)
@@ -393,16 +458,23 @@ class CoilAnalysis:
         self._fil_dl      = fil_dl          # list of (n, 3)
         self._fil_mid     = fil_mid         # list of (n, 3)
 
-    def _bfield_vec_volumetric(self, points, skip_index=None, core_radius=1e-4):
+    def _bfield_vec_volumetric(self, points, skip_index=None, core_radius=1e-4,
+                                skip_neighbors=0):
         """
         B-field from a finite cross-section coil, computed as a weighted sum
         of sub-filament contributions using Gauss-Legendre quadrature.
 
         When n_fil == 1, delegates directly to _bfield_vec (zero overhead).
+
+        The core_radius for each sub-filament is raised to at least
+        the sub-filament radial spacing, so that adjacent segments'
+        outer sub-filaments don't create near-singular fields at
+        the centerline evaluation points at high-curvature locations.
         """
         if self._n_fil <= 1:
             return self._bfield_vec(points, skip_index=skip_index,
-                                     core_radius=core_radius)
+                                     core_radius=core_radius,
+                                     skip_neighbors=skip_neighbors)
 
         single = (np.ndim(points) == 1)
         pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
@@ -410,12 +482,14 @@ class CoilAnalysis:
         I = float(self.current)
         N = float(self.winds)
 
+        vol_cr = core_radius
+
         B = np.zeros((M, 3), dtype=np.float64)
         for f in range(self._n_fil):
-            # Each sub-filament carries weighted current; total sums to I*N
             B_f = self._bfield_from_source(
                 pts, self._fil_coords[f], I, N,
-                skip_index=skip_index, core_radius=core_radius,
+                skip_index=skip_index, core_radius=vol_cr,
+                skip_neighbors=skip_neighbors,
             )
             B += self._fil_weights[f] * B_f
 
@@ -425,14 +499,17 @@ class CoilAnalysis:
     # Total B-field wrappers (self-field + external contributions)
     # ------------------------------------------------------------------
 
-    def _total_bfield(self, points, skip_index=None, core_radius=1e-4):
+    def _total_bfield(self, points, skip_index=None, core_radius=1e-4,
+                       skip_neighbors=0):
         """Self-field (volumetric if available) + B_ext from other coils."""
         if self._n_fil > 1:
             B = self._bfield_vec_volumetric(points, skip_index=skip_index,
-                                             core_radius=core_radius)
+                                             core_radius=core_radius,
+                                             skip_neighbors=skip_neighbors)
         else:
             B = self._bfield_vec(points, skip_index=skip_index,
-                                  core_radius=core_radius)
+                                  core_radius=core_radius,
+                                  skip_neighbors=skip_neighbors)
         if self._B_ext is not None:
             single = (np.ndim(points) == 1)
             pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
@@ -498,17 +575,66 @@ class CoilAnalysis:
     # Force integration — batched evaluation points
     # ------------------------------------------------------------------
 
-    def _compute_segment_force_gauss(self, i, order=16):
-        """16-point Gauss-Legendre Lorentz force on segment i (vectorized)."""
+    def _compute_segment_force_gauss(self, i, order=16, core_radius=1e-4,
+                                      skip_neighbors=0):
+        """16-point Gauss-Legendre Lorentz force on segment i.
+
+        For volumetric coils (n_fil > 1), the force is evaluated at
+        each sub-filament's own position rather than at the centerline.
+        This naturally avoids near-field singularities: each evaluation
+        point is at the same radial offset as the nearest source
+        sub-filament on adjacent segments, keeping the distance ≈ seg_len.
+        """
+        if getattr(self, '_n_fil', 1) > 1:
+            return self._compute_segment_force_gauss_vol(
+                i, order=order, core_radius=core_radius,
+                skip_neighbors=skip_neighbors)
+
         dl_i = self._dl[i]                                      # (3,)
         p0_i = self._p0[i]                                      # (3,)
         pts  = p0_i + self._gauss_ts16[:, None] * dl_i          # (16, 3)
-        B_all = self._total_bfield(pts, skip_index=i)           # (16, 3)
+        B_all = self._total_bfield(pts, skip_index=i,
+                                    core_radius=core_radius,
+                                    skip_neighbors=skip_neighbors)
         crosses = np.cross(dl_i[None], B_all)                   # (16, 3)
         F_i = self._gauss_ws16 @ crosses                        # (3,)
         return self.current * self.winds * F_i
 
-    def _compute_segment_force_simpson(self, i, panels=4):
+    def _compute_segment_force_gauss_vol(self, i, order=16,
+                                          core_radius=1e-4,
+                                          skip_neighbors=0):
+        """Volumetric Lorentz force: weighted sum over sub-filaments.
+
+        Each sub-filament f evaluates the total B-field at its OWN
+        Gauss points (not the centerline), using its own dl.  The
+        force F_f = weight_f × I × N × ∫ dl_f × B(pos_f) is summed
+        over all sub-filaments to give the total winding-pack force
+        on segment i.
+
+        Also stores per-sub-filament force magnitudes in
+        self._fil_F_mags[f][i] for radial-gradient visualisation.
+        """
+        F_total = np.zeros(3, dtype=np.float64)
+        I_N = float(self.current * self.winds)
+        for f in range(self._n_fil):
+            dl_f  = self._fil_dl[f][i]                          # (3,)
+            p0_f  = self._fil_coords[f][i]                      # (3,)
+            pts_f = p0_f + self._gauss_ts16[:, None] * dl_f     # (16, 3)
+            B_f   = self._total_bfield(
+                pts_f, skip_index=i,
+                core_radius=core_radius,
+                skip_neighbors=skip_neighbors)                  # (16, 3)
+            crosses = np.cross(dl_f[None, :], B_f)              # (16, 3)
+            F_f = self._gauss_ws16 @ crosses                    # (3,)
+            F_total += self._fil_weights[f] * F_f
+            # Store per-filament force magnitude
+            if hasattr(self, '_fil_F_mags'):
+                self._fil_F_mags[f][i] = float(np.linalg.norm(
+                    I_N * self._fil_weights[f] * F_f))
+        return I_N * F_total
+
+    def _compute_segment_force_simpson(self, i, panels=4, core_radius=1e-4,
+                                        skip_neighbors=0):
         """Composite Simpson's-rule Lorentz force on segment i (vectorized)."""
         if panels % 2 != 0:
             raise ValueError("Simpson panels must be even")
@@ -520,7 +646,9 @@ class CoilAnalysis:
         wts[1:-1:2] = 4
         wts[2:-1:2] = 2
         pts  = p0 + ts[:, None] * dl                           # (p+1, 3)
-        B_all = self._total_bfield(pts, skip_index=i)          # (p+1, 3)
+        B_all = self._total_bfield(pts, skip_index=i,
+                                    core_radius=core_radius,
+                                    skip_neighbors=skip_neighbors)
         crosses = np.cross(dl[None], B_all)                    # (p+1, 3)
         F_acc = wts @ crosses                                  # (3,)
         return (self.current * self.winds) * (h / 3.0) * F_acc
@@ -679,13 +807,41 @@ class CoilAnalysis:
 
         axis /= (np.linalg.norm(axis) + 1e-30)
 
-        dx     = mids - mean
-        a      = axis.reshape(3, 1)
-        P      = np.eye(3) - a @ a.T
+        # Radial direction: prefer supplied normals (bobbin), then Frenet, then radial
+        n_seg = len(mids)
+        u_r = None
+        if self._supplied_tape_normals is not None:
+            tn = np.asarray(self._supplied_tape_normals, dtype=float)
+            # Normals are per-vertex; average to segment midpoints
+            if len(tn) == n_seg + 1:
+                u_r = 0.5 * (tn[:-1] + tn[1:])
+            elif len(tn) == n_seg:
+                u_r = tn
+            else:
+                u_r = tn[:n_seg] if len(tn) > n_seg else None
+        if u_r is None:
+            try:
+                from physics.geometry import compute_frenet_frame
+                frame = compute_frenet_frame(self.coords)
+                u_r = frame['normal']
+            except Exception:
+                pass
+
+        if u_r is None:
+            dx     = mids - mean
+            a      = axis.reshape(3, 1)
+            P      = np.eye(3) - a @ a.T
+            r_perp = dx @ P.T
+            r_mag_raw = np.linalg.norm(r_perp, axis=1)
+            u_r = np.divide(r_perp, r_mag_raw[:, None] + 1e-30)
+
+        # Perpendicular distance from axis (for sigma = p * r / t)
+        dx = mids - mean
+        a_col = axis.reshape(3, 1)
+        P = np.eye(3) - a_col @ a_col.T
         r_perp = dx @ P.T
-        r_mag  = np.linalg.norm(r_perp, axis=1)
-        eps    = 1e-30
-        u_r    = np.divide(r_perp, r_mag[:, None] + eps)
+        r_mag = np.linalg.norm(r_perp, axis=1)
+        eps = 1e-30
         self.radial_unit = u_r
 
         F_r          = np.einsum('ij,ij->i', F, u_r)
@@ -1162,3 +1318,143 @@ class CoilAnalysis:
 
         B_plane = B_flat.reshape(grid_size, grid_size)
         return X, Y, B_plane, e1, e2, center, R
+
+    # ------------------------------------------------------------------
+    # Self-inductance (Neumann formula)
+    # ------------------------------------------------------------------
+
+    def _compute_self_inductance(self):
+        """
+        Self-inductance via the Neumann integral on the coil centerline.
+
+        L = (µ₀ N² / (4π)) ∮∮ (dl_i · dl_j) / |r_i - r_j|
+
+        Uses the vectorized segment midpoints and tangents already computed.
+        Regularises the diagonal (i==j) with the GMD of a rectangular
+        cross-section to avoid the log-divergence.
+        """
+        if self.midpoints is None or self._dl is None:
+            return
+
+        mu0_4pi = 1e-7
+        N = float(self.winds)
+        n = len(self.midpoints)
+
+        dl = self._dl                   # (n, 3)
+        mid = self.midpoints             # (n, 3)
+
+        # Pairwise distance matrix between segment midpoints
+        diff = mid[:, None, :] - mid[None, :, :]   # (n, n, 3)
+        dist = np.linalg.norm(diff, axis=2)          # (n, n)
+
+        # Regularise diagonal: use GMD of rectangular cross-section
+        # GMD ≈ 0.2235 × (a + b) for a rectangle a × b
+        a = self.total_thickness
+        b = self.tape_width
+        gmd = 0.2235 * (a + b)
+        np.fill_diagonal(dist, max(gmd, 1e-6))
+
+        # Neumann double sum: L = µ₀N²/(4π) × Σ_i Σ_j (dl_i · dl_j) / r_ij
+        dot_matrix = np.einsum('ik,jk->ij', dl, dl)  # (n, n)
+        L = mu0_4pi * N * N * np.sum(dot_matrix / dist)
+
+        self.self_inductance = float(L)
+        self.stored_energy = 0.5 * L * self.current * self.current
+
+    # ------------------------------------------------------------------
+    # Field harmonics (cylindrical multipole decomposition)
+    # ------------------------------------------------------------------
+
+    def compute_field_harmonics(
+        self,
+        r_ref: float = None,
+        n_phi: int = 64,
+        n_max: int = 10,
+        z_positions: np.ndarray = None,
+    ) -> dict:
+        """
+        Decompose the B-field into cylindrical multipole harmonics.
+
+        At each axial position z, sample B on a circle of radius r_ref in
+        the plane perpendicular to the PCA axis, then Fourier-decompose the
+        radial and azimuthal components to extract multipole coefficients
+        b_n (normal) and a_n (skew).
+
+        This is the standard method used in accelerator magnet field quality
+        assessment (RAT, ROXIE, etc.).
+
+        Parameters
+        ----------
+        r_ref       : reference radius (m); default = 2/3 of coil bore radius
+        n_phi       : azimuthal sampling points per circle
+        n_max       : maximum harmonic order
+        z_positions : axial positions to sample; default = 5 equally spaced
+
+        Returns
+        -------
+        dict with:
+            'z'    : (nz,) axial positions
+            'b_n'  : (nz, n_max) normal harmonics (T) at r_ref
+            'a_n'  : (nz, n_max) skew harmonics (T) at r_ref
+            'r_ref': float — reference radius used
+        """
+        if self.mean_point is None or self.axis is None or self.midpoints is None:
+            return None
+
+        a = self.axis / np.linalg.norm(self.axis)
+        R_coil = float(np.max(np.linalg.norm(
+            self.midpoints - self.mean_point, axis=1
+        )))
+
+        if r_ref is None:
+            r_ref = R_coil * 0.667
+
+        # Build local coordinate system
+        if abs(a[2]) < 0.9:
+            e1 = np.cross(a, np.array([0., 0., 1.]))
+        else:
+            e1 = np.cross(a, np.array([1., 0., 0.]))
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(a, e1)
+
+        if z_positions is None:
+            L = self.total_length if self.total_length else R_coil * 2
+            z_positions = np.linspace(-L * 0.3, L * 0.3, 5)
+
+        nz = len(z_positions)
+        phi = np.linspace(0, 2.0 * np.pi, n_phi, endpoint=False)
+        cos_phi = np.cos(phi)
+        sin_phi = np.sin(phi)
+
+        b_n = np.zeros((nz, n_max), dtype=np.float64)
+        a_n = np.zeros((nz, n_max), dtype=np.float64)
+
+        for iz, z_off in enumerate(z_positions):
+            center = self.mean_point + z_off * a
+            # Points on the reference circle
+            pts = (center[None, :]
+                   + r_ref * cos_phi[:, None] * e1[None, :]
+                   + r_ref * sin_phi[:, None] * e2[None, :])
+
+            B = self._total_bfield(pts)  # (n_phi, 3)
+
+            # Project B onto radial and azimuthal directions
+            B_r = np.zeros(n_phi)
+            B_phi_arr = np.zeros(n_phi)
+            for ip in range(n_phi):
+                e_r = cos_phi[ip] * e1 + sin_phi[ip] * e2
+                e_phi_dir = -sin_phi[ip] * e1 + cos_phi[ip] * e2
+                B_r[ip] = np.dot(B[ip], e_r)
+                B_phi_arr[ip] = np.dot(B[ip], e_phi_dir)
+
+            # Fourier decomposition: B_r(φ) = Σ [b_n cos(nφ) + a_n sin(nφ)]
+            for n in range(1, n_max + 1):
+                b_n[iz, n - 1] = (2.0 / n_phi) * np.sum(B_r * np.cos(n * phi))
+                a_n[iz, n - 1] = (2.0 / n_phi) * np.sum(B_r * np.sin(n * phi))
+
+        return {
+            'z': np.asarray(z_positions),
+            'b_n': b_n,
+            'a_n': a_n,
+            'r_ref': r_ref,
+        }

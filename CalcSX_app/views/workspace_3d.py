@@ -46,6 +46,9 @@ class _Layer:
     actors:     list = field(default_factory=list)
     visible:    bool = True
     scalar_bar: object = None
+    cmap:       str  = ''       # colormap name used at add time
+    scalars_name: str = ''      # active scalars array name
+    clim:       tuple = None    # (vmin, vmax) or None for auto
 
 
 def _set_visible(actor, visible: bool) -> None:
@@ -713,6 +716,10 @@ class Workspace3DView(QWidget):
         self._event_filter: _GizmoEventFilter | None = None
         self._hint_label    = None
         self._stale_callback = None   # called when a coil is transformed after analysis
+        self._force_scalar_bar = None  # shared scalar bar for global force scale
+        self._gizmo_target:  str = 'coil'   # 'coil' or 'probe'
+        self._probe_entries: dict[str, dict] = {}  # probe_id → {position, xfm_params}
+        self._active_probe_id: str | None = None
 
         if not _HAS_PYVISTA:
             lbl = QLabel(
@@ -906,7 +913,16 @@ class Workspace3DView(QWidget):
     # ── Gizmo callback ────────────────────────────────────────────────────────
 
     def _on_gizmo_transform(self, tx, ty, tz, rx, ry, rz) -> None:
-        self.apply_coil_transform(tx, ty, tz, rx, ry, rz)
+        if getattr(self, '_gizmo_target', 'coil') == 'probe':
+            self.apply_probe_transform(tx, ty, tz, rx, ry, rz)
+            # Notify MainWindow to update readout
+            if self._stale_callback is not None:
+                try:
+                    self._stale_callback()
+                except Exception:
+                    pass
+        else:
+            self.apply_coil_transform(tx, ty, tz, rx, ry, rz)
 
     # ── Floor grid ────────────────────────────────────────────────────────────
 
@@ -948,17 +964,20 @@ class Workspace3DView(QWidget):
     # ── Multi-coil API ────────────────────────────────────────────────────────
 
     @staticmethod
+    @staticmethod
     def _build_tube_mesh(coords: np.ndarray, total_thickness: float,
-                          tape_width: float) -> 'pv.PolyData | None':
-        """Build a swept rectangular cross-section mesh along *coords*.
+                          tape_width: float,
+                          tape_normals: 'np.ndarray | None' = None,
+                          n_r: int = 4, n_a: int = 2,
+                          ) -> 'pv.PolyData | None':
+        """Build a swept winding-pack mesh with per-turn grid structure.
 
-        Returns a pv.PolyData with quad faces, or None on failure.
+        The cross-section rectangle is subdivided into *n_r* radial
+        layers (turns stacking outward) × *n_a* axial slices (tape
+        width).  The surface shows the turn grid via quad edges.
+        Two end caps expose the full cross-section grid.
 
-        REBCO winding: tape wraps around the coil form, each turn adding
-        one tape_thickness radially.  Therefore:
-          - **radial** extent = total_thickness = winds × tape_thickness
-                                (turns stack outward from the coil form)
-          - **axial** extent  = tape_width  (ribbon width runs along the axis)
+        Returns a pv.PolyData or None on failure.
         """
         try:
             c = np.asarray(coords, dtype=np.float64)
@@ -966,60 +985,115 @@ class Workspace3DView(QWidget):
             if n < 3:
                 return None
 
-            # Local frame per vertex
-            centroid = c.mean(axis=0)
+            # ── local frame per vertex ──
             tangents = np.empty_like(c)
-            tangents[1:-1] = c[2:] - c[:-2]                     # central diff
+            tangents[1:-1] = c[2:] - c[:-2]
             tangents[0]    = c[1] - c[0]
             tangents[-1]   = c[-1] - c[-2]
             t_mag = np.linalg.norm(tangents, axis=1, keepdims=True).clip(1e-12)
             tangents /= t_mag
 
-            # Radial: outward from centroid, perpendicular to tangent
-            dx     = c - centroid
-            proj   = np.einsum('ij,ij->i', dx, tangents)[:, None] * tangents
-            radial = dx - proj
-            r_mag  = np.linalg.norm(radial, axis=1, keepdims=True).clip(1e-12)
-            e_r    = radial / r_mag                               # (n, 3)
-            # Binormal = tangent × radial (≈ axial direction)
-            e_b    = np.cross(tangents, e_r)
-            b_mag  = np.linalg.norm(e_b, axis=1, keepdims=True).clip(1e-12)
-            e_b   /= b_mag
+            if tape_normals is not None and len(tape_normals) == n:
+                tn = np.asarray(tape_normals, dtype=np.float64)
+                proj = np.einsum('ij,ij->i', tn, tangents)[:, None] * tangents
+                radial = tn - proj
+                r_mag = np.linalg.norm(radial, axis=1, keepdims=True).clip(1e-12)
+                e_r = radial / r_mag
+            else:
+                centroid = c.mean(axis=0)
+                dx     = c - centroid
+                proj   = np.einsum('ij,ij->i', dx, tangents)[:, None] * tangents
+                radial = dx - proj
+                r_mag  = np.linalg.norm(radial, axis=1, keepdims=True).clip(1e-12)
+                e_r    = radial / r_mag
 
-            # REBCO: total_thickness is radial, tape_width is axial
-            hr = total_thickness * 0.5    # half radial extent
-            ha = tape_width * 0.5         # half axial extent
+            e_b = np.cross(tangents, e_r)
+            b_mag = np.linalg.norm(e_b, axis=1, keepdims=True).clip(1e-12)
+            e_b /= b_mag
 
-            # 4 corner offsets: (radial, axial)
-            corners = [
-                (-hr, -ha),
-                ( hr, -ha),
-                ( hr,  ha),
-                (-hr,  ha),
-            ]
+            T  = total_thickness
+            ha = tape_width * 0.5
+            r_vals = np.linspace(0.0, T, n_r + 1)
+            a_vals = np.linspace(-ha, ha, n_a + 1)
 
-            # Build vertex array: n_verts × 4 corners
-            all_pts = np.empty((n * 4, 3), dtype=np.float32)
-            for ci, (dr, db) in enumerate(corners):
-                all_pts[ci::4] = (c + dr * e_r + db * e_b).astype(np.float32)
+            # ── perimeter offsets (CCW around cross-section) ──
+            peri = []                       # list of (dr, da)
+            for ri in range(n_r):           # bottom: a=-ha, r ascending
+                peri.append((r_vals[ri], -ha))
+            for ai in range(n_a):           # right:  r=T,   a ascending
+                peri.append((T, a_vals[ai]))
+            for ri in range(n_r, 0, -1):    # top:    a=+ha, r descending
+                peri.append((r_vals[ri], ha))
+            for ai in range(n_a, 0, -1):    # left:   r=0,   a descending
+                peri.append((0.0, a_vals[ai]))
+            n_peri = len(peri)              # = 2*(n_r + n_a)
 
-            # Build quad faces connecting adjacent cross-sections
+            # ── surface vertices: n × n_peri ──
+            surf_pts = np.empty((n * n_peri, 3), dtype=np.float32)
+            for pi, (dr, da) in enumerate(peri):
+                surf_pts[pi::n_peri] = (c + dr * e_r + da * e_b).astype(np.float32)
+
+            # ── surface quads ──
             faces = []
             for i in range(n - 1):
-                base0 = i * 4
-                base1 = (i + 1) * 4
-                for j in range(4):
-                    j1 = (j + 1) % 4
-                    faces.extend([4, base0 + j, base0 + j1, base1 + j1, base1 + j])
+                b0 = i * n_peri
+                b1 = (i + 1) * n_peri
+                for j in range(n_peri):
+                    j1 = (j + 1) % n_peri
+                    faces.extend([4, b0 + j, b0 + j1, b1 + j1, b1 + j])
+
+            # ── end caps (full grid) ──
+            cap_pts_list = []
+            cap_base = n * n_peri
+            stride = n_a + 1
+            for ci_cap in (0, n - 1):
+                local_base = cap_base + len(cap_pts_list)
+                for ri in range(n_r + 1):
+                    for ai in range(n_a + 1):
+                        pt = c[ci_cap] + r_vals[ri] * e_r[ci_cap] + a_vals[ai] * e_b[ci_cap]
+                        cap_pts_list.append(pt.astype(np.float32))
+                for ri in range(n_r):
+                    for ai in range(n_a):
+                        v0 = local_base + ri * stride + ai
+                        faces.extend([4, v0, v0 + 1, v0 + stride + 1, v0 + stride])
+
+            all_pts = surf_pts
+            if cap_pts_list:
+                all_pts = np.vstack([surf_pts,
+                                     np.array(cap_pts_list, dtype=np.float32)])
 
             mesh = pv.PolyData(all_pts, np.array(faces, dtype=np.int32))
+            # Store layout constants for scalar mapping
+            mesh.field_data['n_peri'] = np.array([n_peri], dtype=np.int32)
+            mesh.field_data['n_path'] = np.array([n], dtype=np.int32)
+            mesh.field_data['n_r'] = np.array([n_r], dtype=np.int32)
+            mesh.field_data['n_a'] = np.array([n_a], dtype=np.int32)
             mesh.compute_normals(inplace=True, auto_orient_normals=True)
             return mesh
         except Exception:
             return None
 
+    def add_bobbin_mesh(
+        self, bobbin_id: str, mesh, color: str = '#888888', opacity: float = 0.2,
+    ) -> None:
+        """Render a bobbin/former solid as a translucent mesh."""
+        if self._plotter is None:
+            return
+        try:
+            a = self._plotter.add_mesh(
+                mesh, color=color, opacity=opacity,
+                show_edges=True, edge_color=THEME.get('edge', '#404040'),
+                reset_camera=False, render=False,
+            )
+            # Store as a layer so it can be toggled
+            self._layers[(bobbin_id, 'Bobbin')] = _Layer('Bobbin', actors=[a])
+            self._plotter.render()
+        except Exception:
+            pass
+
     def add_coil(self, coords: np.ndarray, coil_id: str, color: str = None,
-                  total_thickness: float = 0.0, tape_width: float = 0.0) -> None:
+                  total_thickness: float = 0.0, tape_width: float = 0.0,
+                  tape_normals: 'np.ndarray | None' = None) -> None:
         """Add (or replace) a coil in the scene without clearing other coils.
 
         If total_thickness and tape_width are > 0, the coil renders as a
@@ -1046,10 +1120,11 @@ class Workspace3DView(QWidget):
         actors = []
         tube_ok = total_thickness > 0 and tape_width > 0
         if tube_ok:
-            tube_mesh = self._build_tube_mesh(c, total_thickness, tape_width)
+            tube_mesh = self._build_tube_mesh(c, total_thickness, tape_width,
+                                                tape_normals=tape_normals)
             if tube_mesh is not None:
                 a_tube = self._plotter.add_mesh(
-                    tube_mesh, color=coil_color, opacity=0.55,
+                    tube_mesh, color='#b0b0b0', opacity=0.75,
                     show_edges=True, edge_color=THEME.get('edge', '#404040'),
                     reset_camera=False, render=False,
                 )
@@ -1117,7 +1192,18 @@ class Workspace3DView(QWidget):
             all_coords = np.vstack([e['coords'] for e in self._coil_entries.values()])
             self._rebuild_floor(all_coords)
 
-        self._plotter.render()
+        # Preserve camera position — don't reset view on delete
+        try:
+            vtk_cam = self._plotter.renderer.GetActiveCamera()
+            pos = vtk_cam.GetPosition()
+            foc = vtk_cam.GetFocalPoint()
+            vup = vtk_cam.GetViewUp()
+            self._plotter.render()
+            vtk_cam.SetPosition(pos)
+            vtk_cam.SetFocalPoint(foc)
+            vtk_cam.SetViewUp(vup)
+        except Exception:
+            self._plotter.render()
 
     def set_active_coil(self, coil_id: str) -> None:
         if coil_id not in self._coil_entries:
@@ -1136,7 +1222,8 @@ class Workspace3DView(QWidget):
                 self._gizmo._sync_pos()
 
     def update_coil_mesh(self, coil_id: str,
-                          total_thickness: float, tape_width: float) -> None:
+                          total_thickness: float, tape_width: float,
+                          tape_normals: 'np.ndarray | None' = None) -> None:
         """Rebuild a coil's visual mesh (tube + wire) after parameter changes,
         preserving transforms and analysis layers."""
         entry = self._coil_entries.get(coil_id)
@@ -1146,6 +1233,7 @@ class Workspace3DView(QWidget):
         c          = entry['coords']
         coil_color = entry['color']
         xfm        = entry.get('xfm_params')
+
 
         # Remove old actors
         for actor in entry['actors']:
@@ -1158,10 +1246,11 @@ class Workspace3DView(QWidget):
         actors = []
         tube_ok = total_thickness > 0 and tape_width > 0
         if tube_ok:
-            tube_mesh = self._build_tube_mesh(c, total_thickness, tape_width)
+            tube_mesh = self._build_tube_mesh(c, total_thickness, tape_width,
+                                               tape_normals=tape_normals)
             if tube_mesh is not None:
                 a_tube = self._plotter.add_mesh(
-                    tube_mesh, color=coil_color, opacity=0.55,
+                    tube_mesh, color='#b0b0b0', opacity=0.75,
                     show_edges=True, edge_color=THEME.get('edge', '#404040'),
                     reset_camera=False, render=False,
                 )
@@ -1216,10 +1305,25 @@ class Workspace3DView(QWidget):
         self._plotter.render()
 
     def set_coil_visible(self, coil_id: str, visible: bool) -> None:
-        if coil_id not in self._coil_entries or self._plotter is None:
+        if self._plotter is None:
             return
+        # Bobbin display mesh — stored as a layer
+        bobbin_key = (coil_id, 'Bobbin')
+        if bobbin_key in self._layers:
+            for actor in self._layers[bobbin_key].actors:
+                _set_visible(actor, visible)
+            self._plotter.render()
+            return
+        if coil_id not in self._coil_entries:
+            return
+        # Toggle coil actors (tube + wire)
         for actor in self._coil_entries[coil_id]['actors']:
             _set_visible(actor, visible)
+        # Toggle all analysis layers belonging to this coil
+        for (cid, lname), layer in self._layers.items():
+            if cid == coil_id:
+                for actor in layer.actors:
+                    _set_visible(actor, visible)
         self._plotter.render()
 
     def set_stale_callback(self, cb) -> None:
@@ -1427,55 +1531,223 @@ class Workspace3DView(QWidget):
 
     # ── Analysis layer API ────────────────────────────────────────────────────
 
-    def add_force_layer(self, engine, coil_id: str, normalized: bool = False) -> None:
+    def add_force_layer(self, engine, coil_id: str, normalized: bool = False,
+                         show_arrows: bool = False,
+                         progress_callback=None) -> None:
+        """Render forces as a colour-gradient on the tape-stack mesh
+        (default) with optional arrow glyphs.
+
+        *progress_callback(pct)* is called during the heavy per-vertex
+        Biot-Savart loop so the caller can update a progress bar.
+        """
         if self._plotter is None:
             return
         name = 'Forces'
         self._remove_layer(coil_id, name)
 
-        midpoints = np.asarray(engine.midpoints, dtype=float)
-        F_vecs    = np.asarray(engine.F_vecs,    dtype=float)
         coords    = np.asarray(engine.coords,    dtype=float)
-        bbox      = float(_ptp(coords, axis=0).max())
-        arrow_len = bbox * 0.07
+        F_vecs    = np.asarray(engine.F_vecs,    dtype=float)
+        midpoints = np.asarray(engine.midpoints, dtype=float)
+        mags      = np.linalg.norm(F_vecs, axis=1)
+        max_mag   = max(float(mags.max()), 1e-30)
 
-        mags    = np.linalg.norm(F_vecs, axis=1)
-        max_mag = max(float(mags.max()), 1e-30)
+        actors = []
+        sb = None
+        s_min, s_max = float(mags.min()), float(mags.max())
+        cmap_name = THEME.get('cmap_forces', 'plasma')
 
-        n    = len(midpoints)
-        step = max(1, n // 300)
-        mp   = np.ascontiguousarray(midpoints[::step], dtype=np.float32)
-        ms   = np.ascontiguousarray(mags[::step],      dtype=np.float32)
+        # ── Map force scalars onto the coil's existing tube mesh ──
+        entry = self._coil_entries.get(coil_id)
+        if entry is not None and entry.get('actors'):
+            tube_actor = entry['actors'][0]
+            mesh = tube_actor.GetMapper().GetInput()
+            try:
+                import vtkmodules.vtkCommonCore as _vtk_core
+                arr = _vtk_core.vtkFloatArray()
+            except ImportError:
+                import vtk as _vtk
+                arr = _vtk.vtkFloatArray()
+            arr.SetName('force_mag')
+            n_verts = mesh.GetNumberOfPoints()
+            arr.SetNumberOfTuples(n_verts)
+            pts_np = np.array(mesh.points, dtype=np.float64)
 
-        unit_vecs = F_vecs / mags[:, None].clip(1e-30)
-        uv = np.ascontiguousarray(unit_vecs[::step], dtype=np.float32)
+            try:
+                n_peri = int(mesh.field_data['n_peri'][0])
+            except Exception:
+                n_peri = 4
+            n_cs = len(coords)
+            n_surf = n_cs * n_peri
 
-        cloud = pv.PolyData(mp)
-        cloud['vectors']   = uv
-        cloud['magnitude'] = ms
-        cloud['mag_norm']  = (ms / max_mag).astype(np.float32)
-        cloud.set_active_vectors('vectors')
+            tangents = np.empty_like(coords)
+            tangents[1:-1] = coords[2:] - coords[:-2]
+            tangents[0] = coords[1] - coords[0]
+            tangents[-1] = coords[-1] - coords[-2]
+            t_mag = np.linalg.norm(tangents, axis=1, keepdims=True).clip(1e-12)
+            tangents /= t_mag
 
-        try:
-            if normalized:
-                glyphs = cloud.glyph(orient='vectors', scale=False,
-                                     factor=arrow_len, geom=pv.Arrow())
-            else:
-                glyphs = cloud.glyph(orient='vectors', scale='mag_norm',
-                                     factor=arrow_len, geom=pv.Arrow())
-            a = self._plotter.add_mesh(
-                glyphs, scalars='magnitude', cmap=THEME.get('cmap_forces', 'plasma'),
-                clim=[float(mags.min()), float(mags.max())],
-                show_scalar_bar=False, reset_camera=False, render=False,
-            )
-        except Exception:
-            a = self._plotter.add_mesh(
-                cloud, scalars='magnitude', cmap=THEME.get('cmap_forces', 'plasma'),
-                point_size=6, show_scalar_bar=False,
-                reset_camera=False, render=False,
-            )
+            # Suppress VTK rendering during batch loop so processEvents
+            # (called by the progress callback) won't trigger a render
+            # on the partially-written mesh — avoids bus-error crashes.
+            self._plotter.suppress_rendering = True
+            batch = 200
+            n_batches = (n_verts + batch - 1) // batch
+            for bi, start in enumerate(range(0, n_verts, batch)):
+                end = min(start + batch, n_verts)
+                B_batch = engine._total_bfield(
+                    pts_np[start:end], skip_index=None, core_radius=1e-4)
+                B_batch = np.atleast_2d(B_batch)
+                for vi in range(start, end):
+                    ci = min(vi // n_peri, n_cs - 1) if vi < n_surf else 0
+                    F_vec = np.cross(tangents[ci], B_batch[vi - start])
+                    arr.SetValue(vi, float(np.linalg.norm(F_vec)))
+                if progress_callback is not None:
+                    progress_callback(bi + 1, n_batches)
+            self._plotter.suppress_rendering = False
 
-        self._layers[(coil_id, name)] = _Layer(name, [a])
+            mesh.GetPointData().SetScalars(arr)
+            mesh.Modified()
+            s_vals = np.array([arr.GetValue(i) for i in range(n_verts)])
+            s_min, s_max = float(s_vals.min()), float(s_vals.max())
+            if s_max - s_min < 1e-30:
+                s_max = s_min + 1.0
+            mapper = tube_actor.GetMapper()
+            mapper.SetScalarModeToUsePointData()
+            mapper.SelectColorArray('force_mag')
+            mapper.SetScalarRange(s_min, s_max)
+            try:
+                import matplotlib.cm as _mcm
+                lut = mapper.GetLookupTable()
+                cm = _mcm.get_cmap(cmap_name)
+                lut.SetNumberOfTableValues(256)
+                for i in range(256):
+                    r, g, b, _a = cm(i / 255.0)
+                    lut.SetTableValue(i, r, g, b, 1.0)
+                lut.Build()
+            except Exception:
+                pass
+            mapper.SetLookupTable(mapper.GetLookupTable())
+            mapper.ScalarVisibilityOn()
+            tube_actor.GetProperty().SetOpacity(1.0)
+
+            # Do NOT create a scalar bar here — rescale_all_force_layers()
+            # creates one shared bar after all coils are processed.
+
+        # ── Optional arrow glyphs ──
+        if show_arrows:
+            bbox      = float(_ptp(coords, axis=0).max())
+            arrow_len = bbox * 0.07
+            n    = len(midpoints)
+            step = max(1, n // 300)
+            mp   = np.ascontiguousarray(midpoints[::step], dtype=np.float32)
+            ms   = np.ascontiguousarray(mags[::step],      dtype=np.float32)
+            unit_vecs = F_vecs / mags[:, None].clip(1e-30)
+            uv = np.ascontiguousarray(unit_vecs[::step], dtype=np.float32)
+
+            cloud = pv.PolyData(mp)
+            cloud['vectors']   = uv
+            cloud['magnitude'] = ms
+            cloud['mag_norm']  = (ms / max_mag).astype(np.float32)
+            cloud.set_active_vectors('vectors')
+            try:
+                if normalized:
+                    glyphs = cloud.glyph(orient='vectors', scale=False,
+                                         factor=arrow_len, geom=pv.Arrow())
+                else:
+                    glyphs = cloud.glyph(orient='vectors', scale='mag_norm',
+                                         factor=arrow_len, geom=pv.Arrow())
+                a_arr = self._plotter.add_mesh(
+                    glyphs, scalars='magnitude', cmap=cmap_name,
+                    clim=[float(mags.min()), float(mags.max())],
+                    show_scalar_bar=False, reset_camera=False, render=False,
+                )
+                actors.append(a_arr)
+            except Exception:
+                pass
+
+        self._layers[(coil_id, name)] = _Layer(
+            name, actors, cmap=cmap_name,
+            scalars_name='force_mag', clim=(s_min, s_max),
+        )
+        self._plotter.render()
+
+    def rescale_all_force_layers(self) -> None:
+        """Unify the colour scale across every coil's force gradient.
+
+        Finds the global min/max |J×B| from all tube actors that carry
+        'force_mag' scalars, sets every mapper to that range, and
+        maintains a single shared scalar bar.
+        """
+        if self._plotter is None:
+            return
+
+        # Collect all tube actors that have force scalars
+        force_actors = []  # (tube_actor, _Layer)
+        for (cid, lname), layer in self._layers.items():
+            if lname != 'Forces':
+                continue
+            entry = self._coil_entries.get(cid)
+            if entry is None or not entry.get('actors'):
+                continue
+            tube_actor = entry['actors'][0]
+            mapper = tube_actor.GetMapper()
+            if mapper is None:
+                continue
+            ds = mapper.GetInput()
+            if ds is None:
+                continue
+            pd = ds.GetPointData()
+            if pd is None or pd.GetArray('force_mag') is None:
+                continue
+            force_actors.append((tube_actor, layer))
+
+        if not force_actors:
+            # Remove stale shared scalar bar if present
+            if getattr(self, '_force_scalar_bar', None) is not None:
+                try:
+                    self._plotter.renderer.RemoveActor2D(self._force_scalar_bar)
+                except Exception:
+                    pass
+                self._force_scalar_bar = None
+            return
+
+        # Global min/max via numpy (fast)
+        g_min, g_max = float('inf'), float('-inf')
+        for tube_actor, _ in force_actors:
+            mesh = pv.wrap(tube_actor.GetMapper().GetInput())
+            vals = np.asarray(mesh.point_data['force_mag'])
+            lo, hi = float(vals.min()), float(vals.max())
+            if lo < g_min:
+                g_min = lo
+            if hi > g_max:
+                g_max = hi
+        if g_max - g_min < 1e-30:
+            g_max = g_min + 1.0
+
+        # Apply global range to all mappers
+        cmap_name = THEME.get('cmap_forces', 'plasma')
+        for tube_actor, layer in force_actors:
+            mapper = tube_actor.GetMapper()
+            mapper.SetScalarRange(g_min, g_max)
+            layer.clim = (g_min, g_max)
+
+        # Shared scalar bar — create once, reuse
+        sb = getattr(self, '_force_scalar_bar', None)
+        if sb is None:
+            sb = self._make_scalar_bar(force_actors[0][0], '|J×B| (N/m)')
+            self._force_scalar_bar = sb
+        else:
+            # Update the LUT reference in case the first actor changed
+            try:
+                sb.SetLookupTable(force_actors[0][0].GetMapper().GetLookupTable())
+            except Exception:
+                pass
+
+        # Store the shared bar on every Forces layer so visibility toggling works
+        for _, layer in force_actors:
+            layer.scalar_bar = sb
+
+        self._reposition_scalar_bars()
         self._plotter.render()
 
     def add_stress_layer(self, engine, coil_id: str) -> None:
@@ -1495,7 +1767,10 @@ class Workspace3DView(QWidget):
             point_size=8, render_points_as_spheres=True,
             show_scalar_bar=False, reset_camera=False, render=False,
         )
-        self._layers[(coil_id, name)] = _Layer(name, [a])
+        cmap_name = THEME.get('cmap_stress', 'YlOrRd')
+        self._layers[(coil_id, name)] = _Layer(
+            name, [a], cmap=cmap_name, scalars_name='stress_MPa',
+        )
         self._plotter.render()
 
     def add_axis_layer(self, engine, coil_id: str) -> None:
@@ -1521,7 +1796,10 @@ class Workspace3DView(QWidget):
             point_size=6, render_points_as_spheres=True,
             show_scalar_bar=False, reset_camera=False, render=False,
         )
-        self._layers[(coil_id, name)] = _Layer(name, [a])
+        cmap_name = THEME.get('cmap_field', 'cool')
+        self._layers[(coil_id, name)] = _Layer(
+            name, [a], cmap=cmap_name, scalars_name='B_mag',
+        )
         self._plotter.render()
 
     def add_field_lines_layer(self, lines: list, B_mags: list, coil_id: str) -> None:
@@ -1554,7 +1832,10 @@ class Workspace3DView(QWidget):
             reset_camera=False, render=False,
         )
         sb = self._make_scalar_bar(a, 'log\u2081\u2080|B| (T)')
-        self._layers[(coil_id, name)] = _Layer(name, [a], scalar_bar=sb)
+        cmap_name = THEME.get('cmap_field', 'cool')
+        self._layers[(coil_id, name)] = _Layer(
+            name, [a], scalar_bar=sb, cmap=cmap_name, scalars_name='fl_log_B',
+        )
         self._reposition_scalar_bars()
         self._plotter.render()
 
@@ -1589,7 +1870,10 @@ class Workspace3DView(QWidget):
             reset_camera=False, render=False,
         )
         sb = self._make_scalar_bar(a, 'log\u2081\u2080|B| (T)')
-        self._layers[(coil_id, name)] = _Layer(name, [a], scalar_bar=sb)
+        cmap_name = THEME.get('cmap_section', 'inferno')
+        self._layers[(coil_id, name)] = _Layer(
+            name, [a], scalar_bar=sb, cmap=cmap_name, scalars_name='cs_log_B',
+        )
         self._reposition_scalar_bars()
         self._plotter.render()
 
@@ -1602,10 +1886,39 @@ class Workspace3DView(QWidget):
         for actor in layer.actors:
             _set_visible(actor, visible)
         if layer.scalar_bar is not None:
-            try:
-                layer.scalar_bar.SetVisibility(int(visible))
-            except Exception:
-                pass
+            # For the shared force bar: show if ANY Forces layer is visible
+            shared = getattr(self, '_force_scalar_bar', None)
+            if shared is not None and layer.scalar_bar is shared:
+                any_vis = any(
+                    l.visible for (_, ln), l in self._layers.items()
+                    if ln == 'Forces'
+                )
+                try:
+                    shared.SetVisibility(int(any_vis))
+                except Exception:
+                    pass
+            else:
+                try:
+                    layer.scalar_bar.SetVisibility(int(visible))
+                except Exception:
+                    pass
+        # Force layer: the tube actor belongs to the coil entry,
+        # not the layer.  Toggle scalar colouring on/off.
+        if name == 'Forces':
+            entry = self._coil_entries.get(coil_id)
+            if entry is not None and entry.get('actors'):
+                tube_actor = entry['actors'][0]
+                try:
+                    mapper = tube_actor.GetMapper()
+                    if visible:
+                        mapper.ScalarVisibilityOn()
+                        tube_actor.GetProperty().SetOpacity(1.0)
+                    else:
+                        mapper.ScalarVisibilityOff()
+                        tube_actor.GetProperty().SetColor(0.69, 0.69, 0.69)
+                        tube_actor.GetProperty().SetOpacity(0.75)
+                except Exception:
+                    pass
         self._reposition_scalar_bars()
         self._plotter.render()
 
@@ -1634,6 +1947,140 @@ class Workspace3DView(QWidget):
     def has_layer(self, coil_id: str, name: str) -> bool:
         return (coil_id, name) in self._layers
 
+    # ── Hall probe ───────────────────────────────────────────────────────────
+
+    def add_hall_probe(self, probe_id: str, position: np.ndarray = None) -> None:
+        """Add a virtual Hall probe at the given position."""
+        if self._plotter is None:
+            return
+
+        if position is None:
+            if self._active_coil_id and self._active_coil_id in self._coil_entries:
+                coords = self._coil_entries[self._active_coil_id].get('coords')
+                if coords is not None:
+                    position = np.mean(coords, axis=0)
+            if position is None:
+                position = np.zeros(3)
+
+        position = np.asarray(position, dtype=np.float64)
+        self._probe_entries[probe_id] = {
+            'position': position.copy(),
+            'xfm_params': None,
+        }
+        self._active_probe_id = probe_id
+
+        bbox_size = 0.02
+        if self._coil_entries:
+            some_coords = next(iter(self._coil_entries.values())).get('coords')
+            if some_coords is not None:
+                bbox_size = float(_ptp(np.asarray(some_coords), axis=0).max()) * 0.03
+
+        box = pv.Box(bounds=[
+            position[0] - bbox_size, position[0] + bbox_size,
+            position[1] - bbox_size, position[1] + bbox_size,
+            position[2] - bbox_size, position[2] + bbox_size,
+        ])
+
+        color = THEME.get('lyr_probe', '#e040fb')
+        a_box = self._plotter.add_mesh(
+            box, color=color, opacity=0.5,
+            reset_camera=False, render=False,
+        )
+
+        self._layers[(probe_id, 'Hall Probe')] = _Layer(
+            'Hall Probe', actors=[a_box],
+        )
+        self._plotter.render()
+
+    def get_probe_position(self, probe_id: str = None) -> np.ndarray | None:
+        """Return world-space position of a probe."""
+        if probe_id is None:
+            probe_id = self._active_probe_id
+        entry = self._probe_entries.get(probe_id)
+        if entry is None:
+            return None
+        pos = entry['position'].copy()
+        xfm = entry.get('xfm_params')
+        if xfm is not None:
+            pos += np.array([xfm[0], xfm[1], xfm[2]])
+        return pos
+
+    def remove_hall_probe(self, probe_id: str) -> None:
+        self._remove_layer(probe_id, 'Hall Probe')
+        self._probe_entries.pop(probe_id, None)
+        if self._active_probe_id == probe_id:
+            # Switch to another probe or back to coil
+            remaining = list(self._probe_entries.keys())
+            self._active_probe_id = remaining[0] if remaining else None
+            if not remaining:
+                self._gizmo_target = 'coil'
+        if self._plotter:
+            self._plotter.render()
+
+    def apply_probe_transform(
+        self, tx: float, ty: float, tz: float,
+        rx: float, ry: float, rz: float,
+    ) -> None:
+        """Apply gizmo transform to the active probe's actors."""
+        pid = self._active_probe_id
+        if pid is None:
+            return
+        layer = self._layers.get((pid, 'Hall Probe'))
+        entry = self._probe_entries.get(pid)
+        if layer is None or entry is None or self._plotter is None:
+            return
+        try:
+            try:
+                from vtkmodules.vtkCommonTransforms import vtkTransform
+            except ImportError:
+                import vtk as _v
+                vtkTransform = _v.vtkTransform
+            cx, cy, cz = map(float, entry['position'])
+
+            t = vtkTransform()
+            t.PostMultiply()
+            t.Translate(-cx, -cy, -cz)
+            t.RotateX(rx); t.RotateY(ry); t.RotateZ(rz)
+            t.Translate(cx + tx, cy + ty, cz + tz)
+
+            for actor in layer.actors:
+                actor.SetUserTransform(t)
+
+            entry['xfm_params'] = (tx, ty, tz, rx, ry, rz)
+        except Exception:
+            pass
+        self._plotter.render()
+
+    # ── Gizmo target routing ─────────────────────────────────────────────────
+
+    def set_gizmo_target(self, target: str) -> None:
+        """Set gizmo target: 'coil' or 'probe'."""
+        self._gizmo_target = target
+
+    def get_gizmo_target(self) -> str:
+        return getattr(self, '_gizmo_target', 'coil')
+
+    def set_active_probe(self, probe_id: str) -> None:
+        self._active_probe_id = probe_id
+
+    def set_probe_color(self, probe_id: str, color: str) -> None:
+        """Change the color of a probe's actors."""
+        layer = self._layers.get((probe_id, 'Hall Probe'))
+        if layer is None:
+            return
+        try:
+            r, g, b = (
+                int(color[1:3], 16) / 255.0,
+                int(color[3:5], 16) / 255.0,
+                int(color[5:7], 16) / 255.0,
+            )
+            for actor in layer.actors:
+                actor.GetProperty().SetColor(r, g, b)
+            if self._plotter:
+                self._plotter.render()
+        except Exception:
+            pass
+
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _remove_layer(self, coil_id: str, name: str) -> None:
@@ -1646,14 +2093,41 @@ class Workspace3DView(QWidget):
                 self._plotter.remove_actor(actor, render=False)
             except Exception:
                 pass
-        if layer.scalar_bar is not None:
-            try:
-                self._plotter.renderer.RemoveActor2D(layer.scalar_bar)
-            except Exception:
+        # Restore coil tube solid colour if removing the Forces layer
+        if name == 'Forces':
+            entry = self._coil_entries.get(coil_id)
+            if entry is not None and entry.get('actors'):
                 try:
-                    self._plotter.remove_actor(layer.scalar_bar, render=False)
+                    tube_actor = entry['actors'][0]
+                    mapper = tube_actor.GetMapper()
+                    mapper.ScalarVisibilityOff()
+                    r, g, b = tuple(
+                        int(entry['color'][i:i+2], 16) / 255.0
+                        for i in (1, 3, 5))
+                    tube_actor.GetProperty().SetColor(r, g, b)
+                    tube_actor.GetProperty().SetOpacity(0.55)
                 except Exception:
                     pass
+        if layer.scalar_bar is not None:
+            # For the shared force scalar bar, only remove it from the
+            # renderer if no other Forces layer still references it.
+            shared = getattr(self, '_force_scalar_bar', None)
+            is_shared = (shared is not None and layer.scalar_bar is shared)
+            other_force_layers = any(
+                l.scalar_bar is shared
+                for k, l in self._layers.items()
+                if k != key and l.scalar_bar is shared
+            ) if is_shared else False
+            if not other_force_layers:
+                try:
+                    self._plotter.renderer.RemoveActor2D(layer.scalar_bar)
+                except Exception:
+                    try:
+                        self._plotter.remove_actor(layer.scalar_bar, render=False)
+                    except Exception:
+                        pass
+                if is_shared:
+                    self._force_scalar_bar = None
         del self._layers[key]
 
     def _make_scalar_bar(self, mesh_actor, title: str) -> object:
@@ -1689,10 +2163,14 @@ class Workspace3DView(QWidget):
 
     def _reposition_scalar_bars(self) -> None:
         """Stack visible scalar bars vertically so they don't overlap."""
+        seen_ids = set()
         visible = []
         for layer in self._layers.values():
             if layer.scalar_bar is not None and layer.visible:
-                visible.append(layer.scalar_bar)
+                sb_id = id(layer.scalar_bar)
+                if sb_id not in seen_ids:
+                    seen_ids.add(sb_id)
+                    visible.append(layer.scalar_bar)
         n = len(visible)
         if n == 0:
             return
@@ -1754,3 +2232,309 @@ class Workspace3DView(QWidget):
         )
         if path:
             self._plotter.screenshot(path)
+
+    # ── glTF per-layer export (Dev Settings) ──────────────────────────────────
+
+    def export_layers_gltf(self, output_dir: str) -> list[str]:
+        """Export each coil geometry and analysis layer as a separate .gltf file.
+
+        Returns list of exported file paths.
+        """
+        import os
+        if not _HAS_PYVISTA or self._plotter is None:
+            return []
+
+        os.makedirs(output_dir, exist_ok=True)
+        exported = []
+
+        def _sanitize(name: str) -> str:
+            return name.replace(' ', '_').replace('/', '_').lower()
+
+        def _apply_world_transform(mesh, actor):
+            """Bake the actor's UserTransform into mesh points (world coords)."""
+            xfm = actor.GetUserTransform()
+            if xfm is not None:
+                mat = np.zeros((4, 4), dtype=np.float64)
+                xfm.GetMatrix().DeepCopy(mat.ravel(), xfm.GetMatrix())
+                pts = np.asarray(mesh.points, dtype=np.float64)
+                ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+                homo = np.hstack([pts, ones])
+                transformed = homo @ mat.T
+                mesh.points = transformed[:, :3].astype(np.float32)
+
+        def _solidify(mesh):
+            """Convert line or point primitives to surface geometry so glTF
+            can carry vertex colors.  Returns a new mesh with faces, or the
+            original mesh if it already has faces.
+            Non-PolyData types (StructuredGrid, UnstructuredGrid) already have
+            surface cells and pass through unchanged."""
+            if not isinstance(mesh, pv.PolyData):
+                return mesh
+            faces = getattr(mesh, 'faces', None)
+            lines = getattr(mesh, 'lines', None)
+            has_faces = faces is not None and len(faces) > 0
+            has_lines = lines is not None and len(lines) > 0
+            if not has_faces and has_lines:
+                try:
+                    bbox = float(_ptp(np.asarray(mesh.points), axis=0).max())
+                    tube = mesh.tube(radius=bbox * 0.0005, n_sides=6)
+                    if tube.n_points > 0:
+                        return tube
+                except Exception:
+                    pass
+            if not has_faces and not has_lines:
+                try:
+                    bbox = float(_ptp(np.asarray(mesh.points), axis=0).max())
+                    sphere = pv.Sphere(radius=bbox * 0.001,
+                                       theta_resolution=6, phi_resolution=6)
+                    glyphed = mesh.glyph(geom=sphere, scale=False)
+                    if glyphed.n_points > 0:
+                        return glyphed
+                except Exception:
+                    pass
+            return mesh
+
+        def _extract_mesh(actor):
+            """Pull the displayable mesh out of a VTK actor with world-space
+            coordinates.  Converts lines/points to surface geometry."""
+            try:
+                mapper = actor.GetMapper()
+                if mapper is None:
+                    return None
+                ds = mapper.GetInput()
+                if ds is None:
+                    return None
+                mesh = pv.wrap(ds).copy()
+                if mesh.n_points == 0:
+                    return None
+                mesh = _solidify(mesh)
+                _apply_world_transform(mesh, actor)
+                return mesh
+            except Exception:
+                return None
+
+        def _actor_solid_color(actor):
+            """Return the actor's solid color as an (R, G, B) uint8 tuple, or None."""
+            try:
+                prop = actor.GetProperty()
+                r, g, b = prop.GetColor()
+                return (int(r * 255), int(g * 255), int(b * 255))
+            except Exception:
+                return None
+
+        def _export_mesh(mesh, filepath, solid_color=None, opacity=1.0,
+                         cmap_name='', scalars_name='', clim=None):
+            """Write a single mesh to a .gltf file using an offscreen plotter.
+            Pass cmap_name/scalars_name/clim for colormapped layers so the
+            offscreen plotter applies the correct THEME colormap."""
+            try:
+                p = pv.Plotter(off_screen=True)
+                kwargs = dict(reset_camera=True)
+                if cmap_name and scalars_name and scalars_name in mesh.point_data:
+                    kwargs['scalars'] = scalars_name
+                    kwargs['cmap'] = cmap_name
+                    if clim is not None:
+                        kwargs['clim'] = list(clim)
+                elif solid_color is not None:
+                    kwargs['color'] = solid_color
+                kwargs['opacity'] = opacity
+                p.add_mesh(mesh, **kwargs)
+                p.export_gltf(filepath)
+                p.close()
+                return True
+            except Exception:
+                return False
+
+        # Export coil geometry meshes
+        for coil_id, entry in self._coil_entries.items():
+            for i, actor in enumerate(entry['actors']):
+                mesh = _extract_mesh(actor)
+                if mesh is None:
+                    continue
+                color = _actor_solid_color(actor) or entry.get('color')
+                try:
+                    opacity = actor.GetProperty().GetOpacity()
+                except Exception:
+                    opacity = 1.0
+                suffix = 'tube' if i == 0 else 'wire'
+                fname = f"coil_{_sanitize(coil_id)}_{suffix}.gltf"
+                fpath = os.path.join(output_dir, fname)
+                if _export_mesh(mesh, fpath, solid_color=color, opacity=opacity):
+                    exported.append(fpath)
+
+        # Export analysis layers — pass the THEME colormap so the offscreen
+        # plotter maps scalars with the correct colours for the active theme.
+        for (coil_id, layer_name), layer in self._layers.items():
+            for actor in layer.actors:
+                mesh = _extract_mesh(actor)
+                if mesh is None:
+                    continue
+                color = _actor_solid_color(actor)
+                try:
+                    opacity = actor.GetProperty().GetOpacity()
+                except Exception:
+                    opacity = 1.0
+                cid_part = _sanitize(coil_id) if coil_id != '__global__' else 'global'
+                fname = f"{cid_part}_{_sanitize(layer_name)}.gltf"
+                fpath = os.path.join(output_dir, fname)
+                if _export_mesh(mesh, fpath, solid_color=color, opacity=opacity,
+                                cmap_name=layer.cmap,
+                                scalars_name=layer.scalars_name,
+                                clim=layer.clim):
+                    exported.append(fpath)
+
+        return exported
+
+    def export_web_layers(self, output_dir: str, theme_name: str) -> list[str]:
+        """Export web-demo glTF layers for a given theme.
+
+        Exports: coil tubes/wires, Forces, B Axis, Field Lines, Bobbin.
+        Skips: Stress, Cross Section, Hall Probe.
+
+        *theme_name* controls the colormaps used for analysis layers.
+        """
+        import os
+        if not _HAS_PYVISTA or self._plotter is None:
+            return []
+
+        from gui.gui_utils import _DARK_THEME, _LIGHT_THEME
+        theme = _DARK_THEME if theme_name == 'dark' else _LIGHT_THEME
+
+        os.makedirs(output_dir, exist_ok=True)
+        exported = []
+
+        _SKIP_LAYERS = {'Stress', 'Cross Section', 'Hall Probe'}
+
+        def _sanitize(name: str) -> str:
+            return name.replace(' ', '_').replace('/', '_').lower()
+
+        def _apply_world_transform(mesh, actor):
+            xfm = actor.GetUserTransform()
+            if xfm is not None:
+                mat = np.zeros((4, 4), dtype=np.float64)
+                xfm.GetMatrix().DeepCopy(mat.ravel(), xfm.GetMatrix())
+                pts = np.asarray(mesh.points, dtype=np.float64)
+                ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+                homo = np.hstack([pts, ones])
+                transformed = homo @ mat.T
+                mesh.points = transformed[:, :3].astype(np.float32)
+
+        def _solidify(mesh):
+            if not isinstance(mesh, pv.PolyData):
+                return mesh
+            faces = getattr(mesh, 'faces', None)
+            lines = getattr(mesh, 'lines', None)
+            has_faces = faces is not None and len(faces) > 0
+            has_lines = lines is not None and len(lines) > 0
+            if not has_faces and has_lines:
+                try:
+                    bbox = float(_ptp(np.asarray(mesh.points), axis=0).max())
+                    tube = mesh.tube(radius=bbox * 0.0005, n_sides=6)
+                    if tube.n_points > 0:
+                        return tube
+                except Exception:
+                    pass
+            if not has_faces and not has_lines:
+                try:
+                    bbox = float(_ptp(np.asarray(mesh.points), axis=0).max())
+                    sphere = pv.Sphere(radius=bbox * 0.001,
+                                       theta_resolution=6, phi_resolution=6)
+                    glyphed = mesh.glyph(geom=sphere, scale=False)
+                    if glyphed.n_points > 0:
+                        return glyphed
+                except Exception:
+                    pass
+            return mesh
+
+        def _extract_mesh(actor):
+            try:
+                mapper = actor.GetMapper()
+                if mapper is None:
+                    return None
+                ds = mapper.GetInput()
+                if ds is None:
+                    return None
+                mesh = pv.wrap(ds).copy()
+                if mesh.n_points == 0:
+                    return None
+                mesh = _solidify(mesh)
+                _apply_world_transform(mesh, actor)
+                return mesh
+            except Exception:
+                return None
+
+        def _actor_solid_color(actor):
+            try:
+                prop = actor.GetProperty()
+                r, g, b = prop.GetColor()
+                return (int(r * 255), int(g * 255), int(b * 255))
+            except Exception:
+                return None
+
+        def _export_mesh(mesh, filepath, solid_color=None, opacity=1.0,
+                         cmap_name='', scalars_name='', clim=None):
+            try:
+                p = pv.Plotter(off_screen=True)
+                kwargs = dict(reset_camera=True)
+                if cmap_name and scalars_name and scalars_name in mesh.point_data:
+                    kwargs['scalars'] = scalars_name
+                    kwargs['cmap'] = cmap_name
+                    if clim is not None:
+                        kwargs['clim'] = list(clim)
+                elif solid_color is not None:
+                    kwargs['color'] = solid_color
+                kwargs['opacity'] = opacity
+                p.add_mesh(mesh, **kwargs)
+                p.export_gltf(filepath)
+                p.close()
+                return True
+            except Exception:
+                return False
+
+        # ── Coil geometry (tubes + wires) ──
+        for coil_id, entry in self._coil_entries.items():
+            for i, actor in enumerate(entry['actors']):
+                mesh = _extract_mesh(actor)
+                if mesh is None:
+                    continue
+                color = _actor_solid_color(actor) or entry.get('color')
+                try:
+                    opacity = actor.GetProperty().GetOpacity()
+                except Exception:
+                    opacity = 1.0
+                suffix = 'tube' if i == 0 else 'wire'
+                fname = f"coil_{_sanitize(coil_id)}_{suffix}.gltf"
+                fpath = os.path.join(output_dir, fname)
+                if _export_mesh(mesh, fpath, solid_color=color, opacity=opacity):
+                    exported.append(fpath)
+
+        # ── Analysis layers (skip Stress / Cross Section / Hall Probe) ──
+        # Use the target theme's colormaps instead of stored layer.cmap
+        _CMAP_MAP = {
+            'Forces':      theme.get('cmap_forces', 'plasma'),
+            'B Axis':      theme.get('cmap_field',  'cool'),
+            'Field Lines': theme.get('cmap_field',  'cool'),
+        }
+        for (coil_id, layer_name), layer in self._layers.items():
+            if layer_name in _SKIP_LAYERS:
+                continue
+            cmap_override = _CMAP_MAP.get(layer_name, '')
+            for actor in layer.actors:
+                mesh = _extract_mesh(actor)
+                if mesh is None:
+                    continue
+                color = _actor_solid_color(actor)
+                try:
+                    opacity = actor.GetProperty().GetOpacity()
+                except Exception:
+                    opacity = 1.0
+                cid_part = _sanitize(coil_id) if coil_id != '__global__' else 'global'
+                fname = f"{cid_part}_{_sanitize(layer_name)}.gltf"
+                fpath = os.path.join(output_dir, fname)
+                if _export_mesh(mesh, fpath, solid_color=color, opacity=opacity,
+                                cmap_name=cmap_override or layer.cmap,
+                                scalars_name=layer.scalars_name,
+                                clim=layer.clim):
+                    exported.append(fpath)
+
+        return exported

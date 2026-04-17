@@ -48,6 +48,7 @@ class MultiCoilEnvironment:
         current: float = 300.0,
         thickness: float = 80.0,
         width: float = 4.0,
+        tape_normals: np.ndarray = None,
     ) -> None:
         """Add or replace a coil.  Marks all OTHER coils stale."""
         self._coil_params[coil_id] = dict(
@@ -56,6 +57,7 @@ class MultiCoilEnvironment:
             current=current,
             thickness=thickness,
             width=width,
+            tape_normals=tape_normals,
         )
         self._rebuild_engine(coil_id)
         # Every existing coil's analysis is now outdated (new neighbour)
@@ -157,6 +159,75 @@ class MultiCoilEnvironment:
                 R = float(np.max(np.linalg.norm(eng.midpoints - eng.mean_point, axis=1)))
                 infos.append({'centroid': eng.mean_point.copy(), 'radius': max(R, 0.01)})
         return infos
+
+    def compute_mutual_inductance_matrix(self, progress_callback=None) -> dict:
+        """
+        Compute the full N×N inductance matrix (self + mutual) via Neumann.
+
+        M(i,j) = (µ₀ Ni Nj / 4π) ΣΣ (dl_a · dl_b) / |r_a - r_b|
+
+        Returns dict with:
+            'coil_ids' : list of coil IDs (ordering matches matrix rows/cols)
+            'L_matrix' : (N, N) ndarray — inductance matrix in Henries
+            'energies' : (N,) ndarray — stored energy per coil ½ L_ii I_i²
+            'total_energy' : float — total stored magnetic energy (J)
+        """
+        mu0_4pi = 1e-7
+        ids = list(self._engines.keys())
+        N = len(ids)
+        L = np.zeros((N, N), dtype=np.float64)
+
+        for i in range(N):
+            eng_i = self._engines[ids[i]]
+            p_i = self._coil_params[ids[i]]
+            if eng_i.midpoints is None or eng_i._dl is None:
+                continue
+            Ni = float(p_i['winds'])
+            mid_i = eng_i.midpoints
+            dl_i = eng_i._dl
+
+            for j in range(i, N):
+                eng_j = self._engines[ids[j]]
+                p_j = self._coil_params[ids[j]]
+                if eng_j.midpoints is None or eng_j._dl is None:
+                    continue
+                Nj = float(p_j['winds'])
+                mid_j = eng_j.midpoints
+                dl_j = eng_j._dl
+
+                # Distance matrix between segment midpoints
+                diff = mid_i[:, None, :] - mid_j[None, :, :]
+                dist = np.linalg.norm(diff, axis=2)
+
+                if i == j:
+                    # Self: regularise diagonal with GMD of cross-section
+                    a = eng_i.total_thickness
+                    b = eng_i.tape_width
+                    gmd = 0.2235 * (a + b)
+                    np.fill_diagonal(dist, max(gmd, 1e-6))
+
+                dist = np.maximum(dist, 1e-10)
+                dot_m = np.einsum('ik,jk->ij', dl_i, dl_j)
+                Mij = mu0_4pi * Ni * Nj * np.sum(dot_m / dist)
+                L[i, j] = Mij
+                L[j, i] = Mij  # symmetric
+
+            if progress_callback:
+                progress_callback(int(100 * (i + 1) / N))
+
+        # Stored energies: E = ½ Σ_ij L_ij I_i I_j
+        currents = np.array([
+            float(self._coil_params[cid]['current']) for cid in ids
+        ])
+        energies = 0.5 * np.diag(L) * currents ** 2
+        total_E = 0.5 * currents @ L @ currents
+
+        return {
+            'coil_ids': ids,
+            'L_matrix': L,
+            'energies': energies,
+            'total_energy': float(total_E),
+        }
 
     def _rebuild_engine(self, coil_id: str) -> None:
         """Create a lightweight CoilAnalysis (PCA + arc only) for _bfield_vec.

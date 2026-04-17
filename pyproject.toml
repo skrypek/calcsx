@@ -4,7 +4,7 @@ build-backend = "briefcase.backend"
 
 [tool.briefcase]
 project_name = "CalcSX_app"
-version      = "2.1.0"
+version      = "2.2.0"
 bundle       = "sx.calc.calcsx"
 
 [tool.briefcase.app.CalcSX_app]
@@ -18,7 +18,6 @@ requires = [
   "numpy",
   "scipy",
   "pandas",
-  "matplotlib",
   "PyQt5",
   "scikit-learn",
   "pyvista",

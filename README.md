@@ -1,6 +1,6 @@
 # CalcSX™
 ### A Magnetostatics Simulation
-**Version:** 2.1.0 &nbsp;|&nbsp; **Author:** Alexander Skrypek &nbsp;|&nbsp; **License:** MIT
+**Version:** 2.2.0 &nbsp;|&nbsp; **Author:** Alexander Skrypek &nbsp;|&nbsp; **License:** MIT
 
 Developed with experimental validation assistance from the Columbia Fusion Research Center (CFRC).
 
@@ -19,6 +19,42 @@ CalcSX™ is a desktop GUI for simulating and analyzing the electromagnetic and 
 - **Volumetric current carrying** — finite winding-pack cross-section via Gauss-Legendre sub-filament discretization
 
 The coil geometry is analyzed with PCA to determine the axis of symmetry automatically.
+
+---
+
+## Version 2.2.0 — Bobbin & Export Update
+
+### Bobbin Channel Import
+
+| Change | Detail |
+|---|---|
+| **`.bobsx` format** | New file format for bobbin groove geometry: centerline coordinates, surface normals, and optional bobbin mesh — exported from Fusion 360 via the CalcSX Exporter add-in |
+| **Fusion 360 Exporter** | Add-in script (`calcsx_exporter/`) that extracts winding channels from multi-groove bobbin CAD models; classifies narrow (single-groove) and wide (multi-groove) faces, chains segments across face boundaries via Union-Find merging |
+| **Supplied tape normals** | Bobbin-imported coils carry surface normals from the groove floor; `_build_filament_grid` uses these for accurate tape-stack orientation instead of PCA fallback |
+| **Bobbin mesh rendering** | Optional translucent solid mesh of the bobbin former displayed alongside coil channels |
+
+### Per-Vertex Force Gradient
+
+| Change | Detail |
+|---|---|
+| **Mesh-based force visualization** | Lorentz force (\|J×B\|) computed at every vertex of the tape-stack mesh via batched Biot-Savart; displayed as a continuous colour gradient on the coil surface instead of discrete arrows |
+| **Volumetric sub-filament forces** | `_compute_segment_force_gauss_vol` evaluates each sub-filament at its own position, eliminating centerline singularity artifacts |
+| **Toggleable arrows** | Force arrows available via Normalize Forces toggle in UTILITIES; default view is the smooth gradient |
+
+### Session Save & Web Export
+
+| Change | Detail |
+|---|---|
+| **`.csx` session files** | Save/Load Session buttons in UTILITIES ribbon; preserves coil paths, parameters, colours, transforms — replaces the old dev-tools JSON export |
+| **Web layer exporter** | Dev Settings tool exports dark + light mode glTF layers for calc.sx web demos; includes tape stacks, wire centerlines, forces, B axis, field lines, and bobbin mesh (excludes stress) |
+
+### Cleanup
+
+| Change | Detail |
+|---|---|
+| **Legacy code removed** | Deleted unused matplotlib-based modules (`plot_defs`, `results_page`, `tab_defs`, `slice_viewer`) and their supporting classes (`WatermarkedCanvas`, `PlotToolbar`, `ViewSwitcherBar`, `LogoMixin`) |
+| **matplotlib removed** | No longer a direct dependency; `pyvista` provides it transitively where needed |
+| **Loading screen polish** | Post-analysis layer building now shows a pulsing busy indicator with stage-only text instead of sitting at 100% with duplicated messages |
 
 ---
 
@@ -71,7 +107,8 @@ The coil geometry is analyzed with PCA to determine the axis of symmetry automat
 
 | Version | Highlights |
 |---|---|
-| **2.1.0** | Multi-coil superposition; volumetric REBCO current carrying; dark/light themes; navigation ViewCube; per-coil parameters; global field lines |
+| **2.2.0** | Bobbin channel import (`.bobsx`); per-vertex force gradient; `.csx` session save/load; web layer exporter; legacy cleanup |
+| 2.1.0 | Multi-coil superposition; volumetric REBCO current carrying; dark/light themes; navigation ViewCube; per-coil parameters; global field lines |
 | 2.0.0 | INSPECT tools (field lines, cross section); interactive transform gizmo |
 | 1.3.0 | Full PyVista/VTK 3-D backend; CAD style workbench; B-field volume |
 | 1.2.0 | Two-panel workbench; dark theme throughout; B-field slice viewer |
@@ -87,9 +124,11 @@ The coil geometry is analyzed with PCA to determine the axis of symmetry automat
 | Coil Visualization | Swept rectangular tube showing winding-pack cross-section, with centerline wire overlay |
 | Multi-Coil Superposition | B-fields from all coils are summed; forces on each coil account for the full environment |
 | Volumetric Current | Gauss-Legendre sub-filament discretization of the REBCO winding pack |
-| Lorentz Force Layer | Per-segment J×B arrow glyphs, colored by magnitude |
+| Per-Vertex Force Gradient | Continuous \|J×B\| color gradient on tape-stack mesh surface; toggleable arrow glyphs |
 | Hoop Stress Layer | Midpoint point cloud colored by hoop stress (MPa) |
 | On-Axis B-Field Layer | Point cloud along the PCA axis colored by \|B\| |
+| Bobbin Import | `.bobsx` groove channel import with surface normals; Fusion 360 exporter add-in included |
+| Session Save/Load | `.csx` files preserve coil arrangement, parameters, colors, and transforms |
 | Field Lines (INSPECT) | 3-D magnetic streamlines with conductor exclusion; per-coil or global mode |
 | Cross Section (INSPECT) | 2-D B-field heatmap in any plane along the axis |
 | Global Field Lines | Superposed field topology across all coils via toggle in INSPECT tab |
@@ -98,6 +137,7 @@ The coil geometry is analyzed with PCA to determine the axis of symmetry automat
 | Navigation Cube | CAD-style ViewCube with click-to-orient and drag-to-orbit |
 | Dark / Light Themes | Switchable via Settings in UTILITIES; viridis light mode, VS-Code dark mode |
 | Transform Gizmo | SolidWorks-style translate/rotate handles; seamless coil switching |
+| Web Layer Export | Dev tool exports dark + light glTF layers for interactive web demos |
 
 ---
 
@@ -113,7 +153,6 @@ Python **3.9** or later is recommended.
 | `numpy` | Numerical arrays, vectorized Biot-Savart kernel |
 | `scipy` | Rotation transforms for coil positioning |
 | `pandas` | CSV loading and data handling |
-| `matplotlib` | Matplotlib backend for legacy plots |
 | `PyQt5` | GUI framework |
 | `scikit-learn` | PCA for coil axis detection |
 | `pyvista` | 3-D mesh data structures (VTK wrapper) |
@@ -122,7 +161,7 @@ Python **3.9** or later is recommended.
 Install all dependencies:
 
 ```bash
-pip install numpy scipy pandas matplotlib PyQt5 scikit-learn pyvista pyvistaqt
+pip install numpy scipy pandas PyQt5 scikit-learn pyvista pyvistaqt
 ```
 
 With a virtual environment (recommended):
@@ -132,7 +171,7 @@ python -m venv .venv
 source .venv/bin/activate       # macOS / Linux
 .venv\Scripts\activate          # Windows
 
-pip install numpy scipy pandas matplotlib PyQt5 scikit-learn pyvista pyvistaqt
+pip install numpy scipy pandas PyQt5 scikit-learn pyvista pyvistaqt
 ```
 
 > **Note — Apple Silicon (M1/M2/M3):** VTK is available via pip on arm64 since VTK 9.2. If `pip install pyvista pyvistaqt` fails, try `conda install -c conda-forge pyvista pyvistaqt`.
@@ -192,7 +231,6 @@ The interface uses a **CAD-style workbench**: ribbon at top, layer browser + pro
 
 ### High Priority
 - **GPU acceleration** — offload the Biot-Savart kernel to CUDA/Metal via CuPy or PyTorch for interactive-speed computation on large coil geometries.
-- **Full volumetric force integration** — integrate J×B over the conductor cross-section (not just at the centerline) with adaptive near/far splitting for performance.
 - **Radial stress profiles** — compute stress at each radial layer within the winding pack; identify peak stress at the innermost turn.
 
 ### Physics Extensions
@@ -207,7 +245,6 @@ The interface uses a **CAD-style workbench**: ribbon at top, layer browser + pro
 
 ### Output and Integration
 - **VTK / ParaView export** — save field volumes and meshes for downstream post-processing.
-- **Persistent settings** — JSON config for last-used parameters and theme preference.
 - **Briefcase packaging** — signed macOS and Windows app bundles.
 
 ---
