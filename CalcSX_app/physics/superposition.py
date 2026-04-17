@@ -11,7 +11,7 @@ while accounting for the magnetic field contributions of neighbouring coils.
 
 from __future__ import annotations
 import numpy as np
-from physics.physics_utils import CoilAnalysis
+from CalcSX_app.physics.physics_utils import CoilAnalysis
 
 
 class MultiCoilEnvironment:

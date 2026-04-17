@@ -52,12 +52,12 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal, pyqtSlot, QSize
 from PyQt5.QtGui import QPixmap
 
-from physics.physics_utils import CoilAnalysis
-from physics.superposition import MultiCoilEnvironment
-from gui.gui_utils import ProgressReporter, THEME, get_app_icon
-from views.workspace_3d import Workspace3DView
+from CalcSX_app.physics.physics_utils import CoilAnalysis
+from CalcSX_app.physics.superposition import MultiCoilEnvironment
+from CalcSX_app.gui.gui_utils import ProgressReporter, THEME, get_app_icon
+from CalcSX_app.views.workspace_3d import Workspace3DView
 
-from version import __version__ as version_module
+from CalcSX_app.version import __version__ as version_module
 __version__ = getattr(version_module, "__version__", "UNKNOWN")
 
 
@@ -152,7 +152,7 @@ class GlobalFieldLinesWorker(QObject):
 
     @pyqtSlot()
     def run(self):
-        from physics.superposition import compute_global_field_lines
+        from CalcSX_app.physics.superposition import compute_global_field_lines
         lines, B_mags = compute_global_field_lines(
             self.B_total,
             self.coil_infos,
@@ -325,7 +325,6 @@ class RibbonBar(QWidget):
     reset_transform          = pyqtSignal()
     generate_coil            = pyqtSignal()
     show_help                = pyqtSignal()
-    normalize_forces_toggled = pyqtSignal(bool)
     open_settings            = pyqtSignal()
     save_session             = pyqtSignal()
     load_session             = pyqtSignal()
@@ -445,7 +444,6 @@ class RibbonBar(QWidget):
         self._construct_w.hide()
 
         # UTILITIES
-        self._btn_normalize = _RibbonBtn("⇈", "Normalize\nForces", checkable=True)
         self._btn_save_ses = _RibbonBtn("⬇", "Save\nSession")
         self._btn_load_ses = _RibbonBtn("⬆", "Load\nSession")
         self._btn_settings  = _RibbonBtn("⚙", "Settings")
@@ -455,8 +453,6 @@ class RibbonBar(QWidget):
         ul = QHBoxLayout(self._util_w)
         ul.setContentsMargins(8, 0, 0, 0)
         ul.setSpacing(4)
-        ul.addWidget(_ribbon_group("FORCES", [self._btn_normalize]))
-        ul.addWidget(_vbar())
         ul.addWidget(_ribbon_group("SESSION", [self._btn_save_ses, self._btn_load_ses]))
         ul.addWidget(_vbar())
         btn_help_util = _RibbonBtn("?", "Help")
@@ -489,7 +485,6 @@ class RibbonBar(QWidget):
         self._btn_reset_xfm.clicked.connect(self.reset_transform)
         self._btn_generate.clicked.connect(self.generate_coil)
         btn_help_sim.clicked.connect(self.show_help)
-        self._btn_normalize.toggled.connect(self.normalize_forces_toggled)
         self._btn_settings.clicked.connect(self.open_settings)
         self._btn_hall_probe.clicked.connect(self.add_hall_probe)
 
@@ -1377,7 +1372,7 @@ class SettingsDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setSpacing(12)
 
-        from gui.gui_utils import get_theme_name
+        from CalcSX_app.gui.gui_utils import get_theme_name
         current = get_theme_name()
 
         # Theme toggle row
@@ -1541,7 +1536,7 @@ class CoilGeneratorDialog(QDialog):
             _ispin("Pts/turn:", 100, 20, 1000, step=20)
 
     def _generate(self):
-        from physics.geometry import (
+        from CalcSX_app.physics.geometry import (
             generate_solenoid, generate_princeton_dee,
             generate_saddle_coil, generate_cct,
         )
@@ -1614,6 +1609,8 @@ class MainWindow(QMainWindow):
         self._active_coil_id:    str | None = None
         self._analyzed_coil_id:  str | None = None   # coil that owns the in-progress analysis
         self._coil_engines:      dict       = {}      # coil_id → CoilAnalysis engine
+        self._coil_analysis_cache: dict     = {}      # coil_id → {force_scalars, midpoints, hoop_stress, bfield_axis_z, bfield_axis_mag, axis, mean_point}
+        self._coil_inspect_cache:  dict     = {}      # coil_id → {field_lines, field_mags, cross_section}
         self._coil_params_map:   dict       = {}      # coil_id → {winds, current, thickness, width, axis_num}
         self._inspect_coil_id:   str | None = None    # coil being currently inspected
         self._pending_inspect:        str | None = None   # 'field_lines' | 'cross_section'
@@ -1683,7 +1680,6 @@ class MainWindow(QMainWindow):
         self.browser.coil_selected.connect(self._on_coil_selected)
         self.browser.coil_renamed.connect(self._on_coil_renamed)
         self.browser.coil_recolored.connect(self._on_coil_recolored)
-        self.ribbon.normalize_forces_toggled.connect(self._on_normalize_forces_toggled)
         self.ribbon.open_settings.connect(self._on_open_settings)
         self.ribbon.save_session.connect(lambda: self._save_session(self))
         self.ribbon.load_session.connect(lambda: self._load_session(self))
@@ -1716,7 +1712,7 @@ class MainWindow(QMainWindow):
         try:
             ext = os.path.splitext(path)[1].lower()
             if ext in ('.step', '.stp', '.iges', '.igs'):
-                from physics.geometry import import_step_centerline
+                from CalcSX_app.physics.geometry import import_step_centerline
                 coords = import_step_centerline(path)
             else:
                 df = pd.read_csv(path)
@@ -1949,6 +1945,8 @@ class MainWindow(QMainWindow):
         # Clear analysis layers and engine for this coil
         self.workspace.clear_analysis_layers(coil_id)
         self._coil_engines.pop(coil_id, None)
+        self._coil_analysis_cache.pop(coil_id, None)
+        self._coil_inspect_cache.pop(coil_id, None)
         self._multi_env.unregister_coil(coil_id)
         self._propagate_staleness()
         if coil_id == self._analyzed_coil_id:
@@ -1968,6 +1966,30 @@ class MainWindow(QMainWindow):
             self.ribbon.set_construct_enabled(False)
             self.ribbon.set_inspect_enabled(False)
 
+    def _refresh_summary_for(self, coil_id: str) -> None:
+        """Populate the Properties summary for *coil_id* from the live
+        engine if present, otherwise from the cached analysis results."""
+        engine = self._coil_engines.get(coil_id)
+        if engine is not None:
+            self.props.update_summary(engine)
+            return
+        ac = self._coil_analysis_cache.get(coil_id)
+        if not ac:
+            return
+        from types import SimpleNamespace
+        ns = SimpleNamespace(
+            B_magnitude=ac.get('B_magnitude'),
+            B_axial=ac.get('B_axial'),
+            bfield_axis_mag=ac.get('bfield_axis_mag'),
+            bfield_axis_z=ac.get('bfield_axis_z'),
+            F_mags=ac.get('F_mags'),
+            hoop_stress=ac.get('hoop_stress'),
+            coords=self._coil_coords.get(coil_id),
+            self_inductance=ac.get('self_inductance'),
+            stored_energy=ac.get('stored_energy'),
+        )
+        self.props.update_summary(ns)
+
     def _on_coil_selected(self, coil_id: str) -> None:
         # Save current coil's spinbox values before switching
         old_cid = self._active_coil_id
@@ -1980,6 +2002,8 @@ class MainWindow(QMainWindow):
         # Load the new coil's params into spinboxes
         self._load_coil_params(coil_id)
         self.workspace.set_active_coil(coil_id)
+        # Show the selected coil's analysis summary if available
+        self._refresh_summary_for(coil_id)
         # If gizmo is active, seamlessly move it to the new coil
         if self.ribbon._btn_translate.isChecked():
             self.workspace.show_gizmo('T')
@@ -2109,16 +2133,40 @@ class MainWindow(QMainWindow):
         def _force_progress(done, total):
             self.reporter.report(87 + int(8 * done / max(total, 1)))
 
-        norm = self.ribbon._btn_normalize.isChecked()
-        self.workspace.add_force_layer(engine, cid, normalized=norm,
-                                        show_arrows=norm,
-                                        progress_callback=_force_progress)
+        force_scalars = self.workspace.add_force_layer(
+            engine, cid, progress_callback=_force_progress,
+        )
 
         self.reporter.set_stage("Building stress & field layers…")
         self.reporter.report(95)
 
         self.workspace.add_stress_layer(engine, cid)
         self.workspace.add_axis_layer(engine, cid)
+
+        # Cache arrays needed to restore these layers from a saved session
+        self._coil_analysis_cache[cid] = {
+            'force_scalars':   force_scalars,
+            'midpoints':       np.asarray(engine.midpoints, dtype=float),
+            'hoop_stress':     np.asarray(engine.hoop_stress, dtype=float),
+            'F_mags':          (np.asarray(engine.F_mags, dtype=float)
+                                if getattr(engine, 'F_mags', None) is not None else None),
+            'bfield_axis_z':   (np.asarray(engine.bfield_axis_z, dtype=float)
+                                if engine.bfield_axis_z is not None else None),
+            'bfield_axis_mag': (np.asarray(engine.bfield_axis_mag, dtype=float)
+                                if engine.bfield_axis_mag is not None else None),
+            'axis':            np.asarray(engine.axis, dtype=float),
+            'mean_point':      np.asarray(engine.mean_point, dtype=float),
+            'B_total':         (np.asarray(engine.B_total, dtype=float)
+                                if getattr(engine, 'B_total', None) is not None else None),
+            'B_magnitude':     (float(engine.B_magnitude)
+                                if getattr(engine, 'B_magnitude', None) is not None else None),
+            'B_axial':         (float(engine.B_axial)
+                                if getattr(engine, 'B_axial', None) is not None else None),
+            'self_inductance': (float(engine.self_inductance)
+                                if getattr(engine, 'self_inductance', None) is not None else None),
+            'stored_energy':   (float(engine.stored_energy)
+                                if getattr(engine, 'stored_energy', None) is not None else None),
+        }
 
         # Unify force colour scale — defer during re-analyze-all so the
         # global range accounts for ALL coils, not just those done so far.
@@ -2255,15 +2303,6 @@ class MainWindow(QMainWindow):
         self.workspace.add_field_lines_layer(lines, B_mags, '__global__')
         self.workspace.rescale_all_field_line_layers()
 
-    def _on_normalize_forces_toggled(self, checked: bool = False) -> None:
-        cid = self._active_coil_id
-        engine = self._coil_engines.get(cid)
-        if engine is None:
-            return
-        self.workspace.add_force_layer(engine, cid, normalized=checked,
-                                        show_arrows=checked)
-        self.workspace.reapply_coil_transform(cid)
-
     def _on_compute_field_lines(self) -> None:
         if self._i_thread is not None and self._i_thread.isRunning():
             return
@@ -2305,6 +2344,10 @@ class MainWindow(QMainWindow):
         self.workspace.add_field_lines_layer(lines, B_mags, cid)
         self.workspace.rescale_all_field_line_layers()
         if cid:
+            # Cache for session save/restore
+            cache = self._coil_inspect_cache.setdefault(cid, {})
+            cache['field_lines'] = [np.asarray(l, dtype=float) for l in lines]
+            cache['field_mags']  = [np.asarray(m, dtype=float) for m in B_mags]
             self.browser.add_layer_to_coil(cid, 'Field Lines')
             # If global field mode is active, hide per-coil lines immediately
             if self.ribbon._btn_global_field.isChecked():
@@ -2351,6 +2394,16 @@ class MainWindow(QMainWindow):
         cid = self._inspect_coil_id
         self.workspace.add_cross_section_layer(X, Y, B_plane, e1, e2, center, R, cid)
         if cid:
+            cache = self._coil_inspect_cache.setdefault(cid, {})
+            cache['cross_section'] = {
+                'X': np.asarray(X, dtype=float),
+                'Y': np.asarray(Y, dtype=float),
+                'B_plane': np.asarray(B_plane, dtype=float),
+                'e1': np.asarray(e1, dtype=float),
+                'e2': np.asarray(e2, dtype=float),
+                'center': np.asarray(center, dtype=float),
+                'R': float(R),
+            }
             self.browser.add_layer_to_coil(cid, 'Cross Section')
 
     def _on_translate_toggled(self, checked: bool) -> None:
@@ -2444,7 +2497,7 @@ class MainWindow(QMainWindow):
             return
         name = name.strip().lower().replace(' ', '-')
 
-        from gui.gui_utils import get_theme_name
+        from CalcSX_app.gui.gui_utils import get_theme_name
         original_theme = get_theme_name()
         total = []
 
@@ -2499,6 +2552,10 @@ class MainWindow(QMainWindow):
         self._coil_names.clear()
         self._coil_params_map.clear()
         self._coil_engines.clear()
+        self._coil_analysis_cache.clear()
+        self._coil_inspect_cache.clear()
+        self._global_fl_cache = None
+        self._global_fl_dirty = True
         self._multi_env = MultiCoilEnvironment()
         self._active_coil_id = None
         self._analyzed_coil_id = None
@@ -2538,6 +2595,28 @@ class MainWindow(QMainWindow):
             raw_params = self._coil_params_map.get(coil_id, {})
             save_params = {k: _jsonable(v) for k, v in raw_params.items()}
             coords = self._coil_coords[coil_id]
+
+            # Serialize cached analysis results (None if not yet analyzed)
+            ac = self._coil_analysis_cache.get(coil_id)
+            if ac is not None:
+                analysis = {k: _jsonable(v) for k, v in ac.items() if v is not None}
+            else:
+                analysis = None
+
+            # Serialize cached inspection results
+            ic = self._coil_inspect_cache.get(coil_id)
+            inspect = None
+            if ic is not None:
+                inspect = {}
+                if 'field_lines' in ic and 'field_mags' in ic:
+                    inspect['field_lines'] = [np.asarray(l).tolist() for l in ic['field_lines']]
+                    inspect['field_mags']  = [np.asarray(m).tolist() for m in ic['field_mags']]
+                if 'cross_section' in ic:
+                    cs = ic['cross_section']
+                    inspect['cross_section'] = {k: _jsonable(v) for k, v in cs.items()}
+                if not inspect:
+                    inspect = None
+
             coils.append({
                 'coil_id':    coil_id,
                 'csv_path':   self._coil_paths.get(coil_id, ''),
@@ -2546,6 +2625,8 @@ class MainWindow(QMainWindow):
                 'coords':     coords.tolist(),
                 'params':     save_params,
                 'xfm_params': list(entry['xfm_params']) if entry.get('xfm_params') else None,
+                'analysis':   analysis,
+                'inspect':    inspect,
             })
 
         # ── Serialize bobbin meshes ──
@@ -2572,9 +2653,23 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
+        # ── Serialize global field lines (if computed) ──
+        global_fl = None
+        if self._global_fl_cache is not None:
+            lines, B_mags = self._global_fl_cache
+            global_fl = {
+                'lines':  [np.asarray(l).tolist() for l in lines],
+                'B_mags': [np.asarray(m).tolist() for m in B_mags],
+                'seeds':  int(getattr(self, '_global_fl_cache_seeds', 0)),
+            }
+
         with open(path, 'w') as f:
-            json.dump({'version': 2, 'coils': coils, 'bobbins': bobbins},
-                      f, indent=2)
+            json.dump({
+                'version': 3,
+                'coils': coils,
+                'bobbins': bobbins,
+                'global_field_lines': global_fl,
+            }, f, indent=2)
 
         n_total = len(coils) + len(bobbins)
         QMessageBox.information(
@@ -2696,6 +2791,85 @@ class MainWindow(QMainWindow):
                 if wc is not None:
                     self._multi_env.update_coil_coords(coil_id, wc)
 
+            # ── Restore saved analysis layers (v3+) ──
+            analysis = entry.get('analysis')
+            if analysis:
+                cache = {}
+                fs = analysis.get('force_scalars')
+                if fs is not None:
+                    fs_np = np.asarray(fs, dtype=np.float32)
+                    self.workspace.add_force_layer_from_scalars(coil_id, fs_np)
+                    self.browser.add_layer_to_coil(coil_id, 'Forces')
+                    cache['force_scalars'] = fs_np
+                mp = analysis.get('midpoints'); hs = analysis.get('hoop_stress')
+                if mp is not None and hs is not None:
+                    mp_np = np.asarray(mp, dtype=float)
+                    hs_np = np.asarray(hs, dtype=float)
+                    self.workspace.add_stress_layer_from_data(coil_id, mp_np, hs_np)
+                    self.browser.add_layer_to_coil(coil_id, 'Stress')
+                    cache['midpoints']   = mp_np
+                    cache['hoop_stress'] = hs_np
+                bz = analysis.get('bfield_axis_z'); bm = analysis.get('bfield_axis_mag')
+                if bz is not None and bm is not None:
+                    bz_np = np.asarray(bz, dtype=float)
+                    bm_np = np.asarray(bm, dtype=float)
+                    ax_np = np.asarray(analysis.get('axis', [0, 0, 1]), dtype=float)
+                    mp_np = np.asarray(analysis.get('mean_point', [0, 0, 0]), dtype=float)
+                    self.workspace.add_axis_layer_from_data(
+                        coil_id, bz_np, bm_np, ax_np, mp_np,
+                    )
+                    self.browser.add_layer_to_coil(coil_id, 'B Axis')
+                    cache.update({
+                        'bfield_axis_z': bz_np, 'bfield_axis_mag': bm_np,
+                        'axis': ax_np, 'mean_point': mp_np,
+                    })
+                # Restore centroid B-field and scalar summary metrics
+                fmags = analysis.get('F_mags')
+                if fmags is not None:
+                    cache['F_mags'] = np.asarray(fmags, dtype=float)
+                bt = analysis.get('B_total')
+                if bt is not None:
+                    cache['B_total'] = np.asarray(bt, dtype=float)
+                for k in ('B_magnitude', 'B_axial', 'self_inductance', 'stored_energy'):
+                    if analysis.get(k) is not None:
+                        cache[k] = float(analysis[k])
+                if cache:
+                    self._coil_analysis_cache[coil_id] = cache
+                    # Also re-apply the coil's current transform to the new layers
+                    self.workspace.reapply_coil_transform(coil_id)
+
+            # ── Restore saved inspection layers (field lines, cross section) ──
+            inspect = entry.get('inspect')
+            if inspect:
+                ic = {}
+                fl = inspect.get('field_lines'); fm = inspect.get('field_mags')
+                if fl and fm:
+                    lines  = [np.asarray(l, dtype=float) for l in fl]
+                    B_mags = [np.asarray(m, dtype=float) for m in fm]
+                    self.workspace.add_field_lines_layer(lines, B_mags, coil_id)
+                    self.browser.add_layer_to_coil(coil_id, 'Field Lines')
+                    ic['field_lines'] = lines
+                    ic['field_mags']  = B_mags
+                cs = inspect.get('cross_section')
+                if cs:
+                    X  = np.asarray(cs['X'], dtype=float)
+                    Y  = np.asarray(cs['Y'], dtype=float)
+                    Bp = np.asarray(cs['B_plane'], dtype=float)
+                    e1 = np.asarray(cs['e1'], dtype=float)
+                    e2 = np.asarray(cs['e2'], dtype=float)
+                    ct = np.asarray(cs['center'], dtype=float)
+                    R  = float(cs['R'])
+                    self.workspace.add_cross_section_layer(
+                        X, Y, Bp, e1, e2, ct, R, coil_id,
+                    )
+                    self.browser.add_layer_to_coil(coil_id, 'Cross Section')
+                    ic['cross_section'] = {
+                        'X': X, 'Y': Y, 'B_plane': Bp,
+                        'e1': e1, 'e2': e2, 'center': ct, 'R': R,
+                    }
+                if ic:
+                    self._coil_inspect_cache[coil_id] = ic
+
             loaded += 1
 
         # ── Restore bobbin meshes ──
@@ -2717,10 +2891,36 @@ class MainWindow(QMainWindow):
                 pass
 
         self._propagate_staleness()
+        # Any coil whose analysis cache was restored is considered fresh
+        for cid in self._coil_analysis_cache:
+            self._multi_env.mark_fresh(cid)
+            for nm in ('Forces', 'Stress', 'B Axis', 'Field Lines', 'Cross Section'):
+                self.browser.mark_layer_stale(cid, nm, False)
+
+        # ── Restore global field lines if saved ──
+        gfl = data.get('global_field_lines')
+        any_field_lines_restored = any(
+            'field_lines' in c for c in self._coil_inspect_cache.values()
+        )
+        if gfl and gfl.get('lines') and gfl.get('B_mags'):
+            lines  = [np.asarray(l, dtype=float) for l in gfl['lines']]
+            B_mags = [np.asarray(m, dtype=float) for m in gfl['B_mags']]
+            self._global_fl_cache = (lines, B_mags)
+            self._global_fl_cache_seeds = int(gfl.get('seeds', 0))
+            self._global_fl_dirty = False
+            self.workspace.add_field_lines_layer(lines, B_mags, '__global__')
+            any_field_lines_restored = True
+
+        # Unify colour scales across restored layers
+        if self._coil_analysis_cache:
+            self.workspace.rescale_all_force_layers()
+        if any_field_lines_restored:
+            self.workspace.rescale_all_field_line_layers()
         self.ribbon.set_inspect_enabled(bool(self._coil_coords))
         self.ribbon.set_construct_enabled(bool(self._coil_coords))
         if self._active_coil_id:
             self._load_coil_params(self._active_coil_id)
+            self._refresh_summary_for(self._active_coil_id)
         self.props.show()
         if self.workspace._plotter:
             self.workspace._plotter.reset_camera()
@@ -2735,7 +2935,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Session Loaded", msg)
 
     def _apply_theme(self, name: str) -> None:
-        from gui.gui_utils import apply_theme_to_app
+        from CalcSX_app.gui.gui_utils import apply_theme_to_app
         apply_theme_to_app(name)
         # Refresh every panel that uses explicit setStyleSheet calls
         self.ribbon.refresh_theme()
@@ -2749,6 +2949,9 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setWindowIcon(themed_icon)
+        # Persist choice across launches
+        from PyQt5.QtCore import QSettings
+        QSettings().setValue("theme", name)
 
     # ── Hall probe handlers ──────────────────────────────────────────────────
 

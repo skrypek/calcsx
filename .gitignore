@@ -7,3 +7,7 @@ venv/
 calc_env/
 .vscode/
 .idea/
+Icon
+build/
+dist/
+logs/

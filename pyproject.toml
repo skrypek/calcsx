@@ -4,7 +4,7 @@ build-backend = "briefcase.backend"
 
 [tool.briefcase]
 project_name = "CalcSX_app"
-version      = "2.2.0"
+version      = "2.3.0"
 bundle       = "sx.calc.calcsx"
 
 [tool.briefcase.app.CalcSX_app]
@@ -13,7 +13,7 @@ description   = "A magnetostatics simulation for superconducting coils"
 author        = "Alexander Skrypek"
 author_email  = "as7168@columbia.edu"
 url           = "https://calc.sx"
-license       = "MIT"
+license       = "Apache-2.0"
 requires = [
   "numpy",
   "scipy",
@@ -21,7 +21,8 @@ requires = [
   "PyQt5",
   "scikit-learn",
   "pyvista",
-  "pyvistaqt"
+  "pyvistaqt",
+  "std-nslog",
 ]
 
 # Only your inner package
@@ -32,6 +33,9 @@ resources     = ["CalcSX_app/resources"]
 icon          = "CalcSX_app/resources/images/app"
 
 entry_point = "CalcSX_app.main:main"
+
+[tool.briefcase.app.CalcSX_app.macOS]
+min_os_version = "12.0"
 
 [tool.briefcase.app.CalcSX_app.document_type.csx]
 description = "CalcSX Coil File"

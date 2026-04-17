@@ -823,7 +823,7 @@ class CoilAnalysis:
                 u_r = tn[:n_seg] if len(tn) > n_seg else None
         if u_r is None:
             try:
-                from physics.geometry import compute_frenet_frame
+                from CalcSX_app.physics.geometry import compute_frenet_frame
                 frame = compute_frenet_frame(self.coords)
                 u_r = frame['normal']
             except Exception:

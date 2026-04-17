@@ -32,7 +32,7 @@ try:
 except ImportError:
     _HAS_PYVISTA = False
 
-from gui.gui_utils import THEME
+from CalcSX_app.gui.gui_utils import THEME
 
 
 def _ptp(arr: np.ndarray, axis=None) -> np.ndarray:
@@ -1492,8 +1492,8 @@ class Workspace3DView(QWidget):
 
     def reapply_coil_transform(self, coil_id: str) -> None:
         """Re-apply the stored delta transform to all existing layers for a coil.
-        Call this after replacing a layer (e.g. normalize toggle) so the new actor
-        respects any translation/rotation that was applied since analysis."""
+        Call this after replacing a layer so the new actor respects any
+        translation/rotation that was applied since analysis."""
         entry = self._coil_entries.get(coil_id)
         if entry is None or self._plotter is None:
             return
@@ -1532,48 +1532,82 @@ class Workspace3DView(QWidget):
 
     # ── Analysis layer API ────────────────────────────────────────────────────
 
-    def add_force_layer(self, engine, coil_id: str, normalized: bool = False,
-                         show_arrows: bool = False,
-                         progress_callback=None) -> None:
-        """Render forces as a color gradient on the tape-stack mesh
-        (default) with optional arrow glyphs."""
+    def _apply_force_scalars_to_tube(self, coil_id: str,
+                                       scalars_np: np.ndarray,
+                                       cmap_name: str) -> tuple:
+        """Attach per-vertex force scalars to the coil's tube mesh and
+        configure its mapper for colour-mapped rendering. Returns
+        (s_min, s_max)."""
+        entry = self._coil_entries.get(coil_id)
+        if entry is None or not entry.get('actors'):
+            return 0.0, 1.0
+        tube_actor = entry['actors'][0]
+        mesh = tube_actor.GetMapper().GetInput()
+        try:
+            import vtkmodules.vtkCommonCore as _vtk_core
+            arr = _vtk_core.vtkFloatArray()
+        except ImportError:
+            import vtk as _vtk
+            arr = _vtk.vtkFloatArray()
+        arr.SetName('force_mag')
+        n = len(scalars_np)
+        arr.SetNumberOfTuples(n)
+        for i, v in enumerate(scalars_np):
+            arr.SetValue(i, float(v))
+        mesh.GetPointData().SetScalars(arr)
+        mesh.Modified()
+
+        s_min = float(scalars_np.min()) if n else 0.0
+        s_max = float(scalars_np.max()) if n else 1.0
+        if s_max - s_min < 1e-30:
+            s_max = s_min + 1.0
+
+        mapper = tube_actor.GetMapper()
+        mapper.SetScalarModeToUsePointData()
+        mapper.SelectColorArray('force_mag')
+        mapper.SetScalarRange(s_min, s_max)
+        try:
+            import matplotlib.cm as _mcm
+            lut = mapper.GetLookupTable()
+            cm = _mcm.get_cmap(cmap_name)
+            lut.SetNumberOfTableValues(256)
+            for i in range(256):
+                r, g, b, _a = cm(i / 255.0)
+                lut.SetTableValue(i, r, g, b, 1.0)
+            lut.Build()
+        except Exception:
+            pass
+        mapper.SetLookupTable(mapper.GetLookupTable())
+        mapper.ScalarVisibilityOn()
+        tube_actor.GetProperty().SetOpacity(1.0)
+        return s_min, s_max
+
+    def add_force_layer(self, engine, coil_id: str,
+                         progress_callback=None):
+        """Render forces as a color gradient on the tape-stack mesh.
+        Returns the per-vertex force-magnitude array (or None if no
+        tube mesh exists)."""
         if self._plotter is None:
-            return
+            return None
         name = 'Forces'
         self._remove_layer(coil_id, name)
 
-        coords    = np.asarray(engine.coords,    dtype=float)
-        F_vecs    = np.asarray(engine.F_vecs,    dtype=float)
-        midpoints = np.asarray(engine.midpoints, dtype=float)
-        mags      = np.linalg.norm(F_vecs, axis=1)
-        max_mag   = max(float(mags.max()), 1e-30)
-
-        actors = []
-        sb = None
-        s_min, s_max = float(mags.min()), float(mags.max())
+        coords    = np.asarray(engine.coords, dtype=float)
         cmap_name = THEME.get('cmap_forces', 'plasma')
+        s_min, s_max = 0.0, 1.0
+        scalars_np = None
 
-        # ── Map force scalars onto the coil's existing tube mesh ──
         entry = self._coil_entries.get(coil_id)
         if entry is not None and entry.get('actors'):
             tube_actor = entry['actors'][0]
             mesh = tube_actor.GetMapper().GetInput()
-            try:
-                import vtkmodules.vtkCommonCore as _vtk_core
-                arr = _vtk_core.vtkFloatArray()
-            except ImportError:
-                import vtk as _vtk
-                arr = _vtk.vtkFloatArray()
-            arr.SetName('force_mag')
             n_verts = mesh.GetNumberOfPoints()
-            arr.SetNumberOfTuples(n_verts)
 
             try:
                 n_peri = int(mesh.field_data['n_peri'][0])
             except Exception:
                 n_peri = 4
             n_cs = len(coords)
-            n_seg = len(mags)         # per-segment force magnitudes
             n_surf = n_cs * n_peri
 
             pts_np = np.array(mesh.points, dtype=np.float64)
@@ -1584,10 +1618,8 @@ class Workspace3DView(QWidget):
             t_mag = np.linalg.norm(tangents, axis=1, keepdims=True).clip(1e-12)
             tangents /= t_mag
 
-            # Suppress VTK rendering so processEvents can update the
-            # progress dialog without triggering a scene repaint.
-            # The scalar array is written to a detached vtkFloatArray
-            # and only committed to the mesh AFTER this loop.
+            scalars_np = np.empty(n_verts, dtype=np.float32)
+
             from PyQt5.QtWidgets import QApplication as _QApp
             self._plotter.suppress_rendering = True
             batch = 100
@@ -1600,7 +1632,7 @@ class Workspace3DView(QWidget):
                 for vi in range(start, end):
                     ci = min(vi // n_peri, n_cs - 1) if vi < n_surf else 0
                     F_vec = np.cross(tangents[ci], B_batch[vi - start])
-                    arr.SetValue(vi, float(np.linalg.norm(F_vec)))
+                    scalars_np[vi] = float(np.linalg.norm(F_vec))
                 del B_batch
                 if bi % 5 == 0:
                     if progress_callback is not None:
@@ -1608,65 +1640,32 @@ class Workspace3DView(QWidget):
                     _QApp.processEvents()
             self._plotter.suppress_rendering = False
 
-            mesh.GetPointData().SetScalars(arr)
-            mesh.Modified()
-            s_vals = np.array([arr.GetValue(i) for i in range(n_verts)])
-            s_min, s_max = float(s_vals.min()), float(s_vals.max())
-            if s_max - s_min < 1e-30:
-                s_max = s_min + 1.0
-            mapper = tube_actor.GetMapper()
-            mapper.SetScalarModeToUsePointData()
-            mapper.SelectColorArray('force_mag')
-            mapper.SetScalarRange(s_min, s_max)
-            try:
-                import matplotlib.cm as _mcm
-                lut = mapper.GetLookupTable()
-                cm = _mcm.get_cmap(cmap_name)
-                lut.SetNumberOfTableValues(256)
-                for i in range(256):
-                    r, g, b, _a = cm(i / 255.0)
-                    lut.SetTableValue(i, r, g, b, 1.0)
-                lut.Build()
-            except Exception:
-                pass
-            mapper.SetLookupTable(mapper.GetLookupTable())
-            mapper.ScalarVisibilityOn()
-            tube_actor.GetProperty().SetOpacity(1.0)
-
-        # ── Optional arrow glyphs ──
-        if show_arrows:
-            bbox      = float(_ptp(coords, axis=0).max())
-            arrow_len = bbox * 0.07
-            n    = len(midpoints)
-            step = max(1, n // 300)
-            mp   = np.ascontiguousarray(midpoints[::step], dtype=np.float32)
-            ms   = np.ascontiguousarray(mags[::step],      dtype=np.float32)
-            unit_vecs = F_vecs / mags[:, None].clip(1e-30)
-            uv = np.ascontiguousarray(unit_vecs[::step], dtype=np.float32)
-
-            cloud = pv.PolyData(mp)
-            cloud['vectors']   = uv
-            cloud['magnitude'] = ms
-            cloud['mag_norm']  = (ms / max_mag).astype(np.float32)
-            cloud.set_active_vectors('vectors')
-            try:
-                if normalized:
-                    glyphs = cloud.glyph(orient='vectors', scale=False,
-                                         factor=arrow_len, geom=pv.Arrow())
-                else:
-                    glyphs = cloud.glyph(orient='vectors', scale='mag_norm',
-                                         factor=arrow_len, geom=pv.Arrow())
-                a_arr = self._plotter.add_mesh(
-                    glyphs, scalars='magnitude', cmap=cmap_name,
-                    clim=[float(mags.min()), float(mags.max())],
-                    show_scalar_bar=False, reset_camera=False, render=False,
-                )
-                actors.append(a_arr)
-            except Exception:
-                pass
+            s_min, s_max = self._apply_force_scalars_to_tube(
+                coil_id, scalars_np, cmap_name,
+            )
 
         self._layers[(coil_id, name)] = _Layer(
-            name, actors, cmap=cmap_name,
+            name, [], cmap=cmap_name,
+            scalars_name='force_mag', clim=(s_min, s_max),
+        )
+        self._plotter.render()
+        return scalars_np
+
+    def add_force_layer_from_scalars(self, coil_id: str,
+                                      scalars_np: np.ndarray) -> None:
+        """Restore a Forces layer from a previously-computed per-vertex
+        scalar array (used when loading a saved session)."""
+        if self._plotter is None:
+            return
+        name = 'Forces'
+        self._remove_layer(coil_id, name)
+        cmap_name = THEME.get('cmap_forces', 'plasma')
+        scalars_np = np.asarray(scalars_np, dtype=np.float32)
+        s_min, s_max = self._apply_force_scalars_to_tube(
+            coil_id, scalars_np, cmap_name,
+        )
+        self._layers[(coil_id, name)] = _Layer(
+            name, [], cmap=cmap_name,
             scalars_name='force_mag', clim=(s_min, s_max),
         )
         self._plotter.render()
@@ -1816,57 +1815,75 @@ class Workspace3DView(QWidget):
         self._reposition_scalar_bars()
         self._plotter.render()
 
-    def add_stress_layer(self, engine, coil_id: str) -> None:
+    def add_stress_layer_from_data(self, coil_id: str,
+                                     midpoints: np.ndarray,
+                                     hoop_stress_Pa: np.ndarray) -> None:
+        """Build the Stress layer from precomputed arrays."""
         if self._plotter is None:
             return
         name = 'Stress'
         self._remove_layer(coil_id, name)
 
-        midpoints = np.asarray(engine.midpoints, dtype=float)
-        stress    = np.asarray(engine.hoop_stress, dtype=float) / 1e6
+        midpoints = np.asarray(midpoints, dtype=float)
+        stress    = np.asarray(hoop_stress_Pa, dtype=float) / 1e6
 
         cloud = pv.PolyData(np.ascontiguousarray(midpoints, dtype=np.float32))
         cloud['stress_MPa'] = stress.astype(np.float32)
 
+        cmap_name = THEME.get('cmap_stress', 'YlOrRd')
         a = self._plotter.add_mesh(
-            cloud, scalars='stress_MPa', cmap=THEME.get('cmap_stress', 'YlOrRd'),
+            cloud, scalars='stress_MPa', cmap=cmap_name,
             point_size=8, render_points_as_spheres=True,
             show_scalar_bar=False, reset_camera=False, render=False,
         )
-        cmap_name = THEME.get('cmap_stress', 'YlOrRd')
         self._layers[(coil_id, name)] = _Layer(
             name, [a], cmap=cmap_name, scalars_name='stress_MPa',
         )
         self._plotter.render()
 
-    def add_axis_layer(self, engine, coil_id: str) -> None:
+    def add_stress_layer(self, engine, coil_id: str) -> None:
+        self.add_stress_layer_from_data(
+            coil_id, engine.midpoints, engine.hoop_stress,
+        )
+
+    def add_axis_layer_from_data(self, coil_id: str,
+                                   z_vals: np.ndarray,
+                                   b_vals: np.ndarray,
+                                   axis_dir: np.ndarray,
+                                   mean_point: np.ndarray) -> None:
+        """Build the B Axis layer from precomputed arrays."""
         if self._plotter is None:
             return
         name = 'B Axis'
         self._remove_layer(coil_id, name)
 
-        if engine.bfield_axis_z is None or engine.bfield_axis_mag is None:
-            return
-
-        z_vals = np.asarray(engine.bfield_axis_z,  dtype=float)
-        b_vals = np.asarray(engine.bfield_axis_mag, dtype=float)
-        a_dir  = np.asarray(engine.axis,            dtype=float)
-        m_pt   = np.asarray(engine.mean_point,      dtype=float)
+        z_vals = np.asarray(z_vals, dtype=float)
+        b_vals = np.asarray(b_vals, dtype=float)
+        a_dir  = np.asarray(axis_dir, dtype=float)
+        m_pt   = np.asarray(mean_point, dtype=float)
         pts    = m_pt[np.newaxis, :] + np.outer(z_vals, a_dir)
 
         cloud = pv.PolyData(np.ascontiguousarray(pts, dtype=np.float32))
         cloud['B_mag'] = b_vals.astype(np.float32)
 
+        cmap_name = THEME.get('cmap_field', 'cool')
         a = self._plotter.add_mesh(
-            cloud, scalars='B_mag', cmap=THEME.get('cmap_field', 'cool'),
+            cloud, scalars='B_mag', cmap=cmap_name,
             point_size=6, render_points_as_spheres=True,
             show_scalar_bar=False, reset_camera=False, render=False,
         )
-        cmap_name = THEME.get('cmap_field', 'cool')
         self._layers[(coil_id, name)] = _Layer(
             name, [a], cmap=cmap_name, scalars_name='B_mag',
         )
         self._plotter.render()
+
+    def add_axis_layer(self, engine, coil_id: str) -> None:
+        if engine.bfield_axis_z is None or engine.bfield_axis_mag is None:
+            return
+        self.add_axis_layer_from_data(
+            coil_id, engine.bfield_axis_z, engine.bfield_axis_mag,
+            engine.axis, engine.mean_point,
+        )
 
     def add_field_lines_layer(self, lines: list, B_mags: list, coil_id: str) -> None:
         if self._plotter is None or not lines:
@@ -2414,7 +2431,7 @@ class Workspace3DView(QWidget):
         if not _HAS_PYVISTA or self._plotter is None:
             return []
 
-        from gui.gui_utils import _DARK_THEME, _LIGHT_THEME
+        from CalcSX_app.gui.gui_utils import _DARK_THEME, _LIGHT_THEME
         theme = _DARK_THEME if theme_name == 'dark' else _LIGHT_THEME
 
         os.makedirs(output_dir, exist_ok=True)

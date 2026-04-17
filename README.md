@@ -1,6 +1,6 @@
 # CalcSX™
 ### A Magnetostatics Simulation
-**Version:** 2.2.0 &nbsp;|&nbsp; **Author:** Alexander Skrypek &nbsp;|&nbsp; **License:** MIT
+**Version:** 2.3.0 &nbsp;|&nbsp; **Author:** Alexander Skrypek &nbsp;|&nbsp; **License:** Apache 2.0
 
 Developed with experimental validation assistance from the Columbia Fusion Research Center (CFRC).
 
@@ -84,6 +84,7 @@ python -m CalcSX_app.main
 
 ## License
 
-MIT License. © 2026 Alexander Skrypek. CalcSX™ is a pending trademark of Alexander Skrypek.
+Copyright 2026 Alexander Skrypek. Licensed under the Apache License, Version 2.0.
+CalcSX™ is a trademark of Alexander Skrypek (USPTO application pending).
 
 For support: as7168@columbia.edu
