@@ -1812,6 +1812,16 @@ class Workspace3DView(QWidget):
         for _, layer in fl_actors:
             layer.scalar_bar = sb
 
+        # Sync the shared bar's visibility to the current layer states — the
+        # hide-locals-then-add-global sequence in _on_global_field_toggled
+        # can otherwise leave the bar in a stale invisible state even when a
+        # field-lines layer is now visible.
+        try:
+            any_vis = any(layer.visible for _, layer in fl_actors)
+            sb.SetVisibility(int(any_vis))
+        except Exception:
+            pass
+
         self._reposition_scalar_bars()
         self._plotter.render()
 
@@ -2035,7 +2045,8 @@ class Workspace3DView(QWidget):
 
     # ── Hall probe ───────────────────────────────────────────────────────────
 
-    def add_hall_probe(self, probe_id: str, position: np.ndarray = None) -> None:
+    def add_hall_probe(self, probe_id: str, position: np.ndarray = None,
+                         color: str = None) -> None:
         """Add a virtual Hall probe at the given position."""
         if self._plotter is None:
             return
@@ -2049,9 +2060,11 @@ class Workspace3DView(QWidget):
                 position = np.zeros(3)
 
         position = np.asarray(position, dtype=np.float64)
+        color = color or THEME.get('lyr_probe', '#e040fb')
         self._probe_entries[probe_id] = {
-            'position': position.copy(),
+            'position':   position.copy(),
             'xfm_params': None,
+            'color':      color,
         }
         self._active_probe_id = probe_id
 
@@ -2067,7 +2080,6 @@ class Workspace3DView(QWidget):
             position[2] - bbox_size, position[2] + bbox_size,
         ])
 
-        color = THEME.get('lyr_probe', '#e040fb')
         a_box = self._plotter.add_mesh(
             box, color=color, opacity=0.5,
             reset_camera=False, render=False,
@@ -2090,6 +2102,53 @@ class Workspace3DView(QWidget):
         if xfm is not None:
             pos += np.array([xfm[0], xfm[1], xfm[2]])
         return pos
+
+    def set_probe_position(self, probe_id: str, new_xyz) -> None:
+        """Set a probe's world-space position absolutely, clearing any
+        gizmo-delta transform. Rebuilds the probe actor at the new location."""
+        entry = self._probe_entries.get(probe_id)
+        if entry is None or self._plotter is None:
+            return
+        new_xyz = np.asarray(new_xyz, dtype=np.float64)
+        # Reuse the existing swatch color
+        color = entry.get('color')
+        # Remove the old layer, then rebuild at the new position
+        self._remove_layer(probe_id, 'Hall Probe')
+        entry['position']   = new_xyz.copy()
+        entry['xfm_params'] = None
+
+        bbox_size = 0.02
+        if self._coil_entries:
+            some_coords = next(iter(self._coil_entries.values())).get('coords')
+            if some_coords is not None:
+                bbox_size = float(_ptp(np.asarray(some_coords), axis=0).max()) * 0.03
+
+        box = pv.Box(bounds=[
+            new_xyz[0] - bbox_size, new_xyz[0] + bbox_size,
+            new_xyz[1] - bbox_size, new_xyz[1] + bbox_size,
+            new_xyz[2] - bbox_size, new_xyz[2] + bbox_size,
+        ])
+        draw_color = color or THEME.get('lyr_probe', '#e040fb')
+        a_box = self._plotter.add_mesh(
+            box, color=draw_color, opacity=0.5,
+            reset_camera=False, render=False,
+        )
+        self._layers[(probe_id, 'Hall Probe')] = _Layer(
+            'Hall Probe', actors=[a_box],
+        )
+        # Reposition the gizmo if it's anchored on this probe
+        if self._active_probe_id == probe_id and self._gizmo is not None:
+            scale = 0.1
+            if self._coil_entries:
+                some = next(iter(self._coil_entries.values())).get('coords')
+                if some is not None:
+                    arr = np.asarray(some)
+                    scale = float((arr.max(axis=0) - arr.min(axis=0)).max()) * 0.15
+            try:
+                self._gizmo.load(new_xyz, scale)
+            except Exception:
+                pass
+        self._plotter.render()
 
     def remove_hall_probe(self, probe_id: str) -> None:
         self._remove_layer(probe_id, 'Hall Probe')
@@ -2154,6 +2213,10 @@ class Workspace3DView(QWidget):
         layer = self._layers.get((probe_id, 'Hall Probe'))
         if layer is None:
             return
+        # Persist so position changes and saves retain the colour
+        entry = self._probe_entries.get(probe_id)
+        if entry is not None:
+            entry['color'] = color
         try:
             r, g, b = (
                 int(color[1:3], 16) / 255.0,
@@ -2219,6 +2282,9 @@ class Workspace3DView(QWidget):
                 if shared_attr:
                     setattr(self, shared_attr, None)
         del self._layers[key]
+        # Restack any remaining visible scalar bars so they fill the space
+        # vacated by the removed layer.
+        self._reposition_scalar_bars()
 
     def _make_scalar_bar(self, mesh_actor, title: str) -> object:
         try:

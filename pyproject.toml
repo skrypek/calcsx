@@ -13,7 +13,7 @@ description   = "A magnetostatics simulation for superconducting coils"
 author        = "Alexander Skrypek"
 author_email  = "as7168@columbia.edu"
 url           = "https://calc.sx"
-license       = "Apache-2.0"
+license.file  = "LICENSE"
 requires = [
   "numpy",
   "scipy",
@@ -37,10 +37,10 @@ entry_point = "CalcSX_app.main:main"
 [tool.briefcase.app.CalcSX_app.macOS]
 min_os_version = "12.0"
 
-[tool.briefcase.app.CalcSX_app.document_type.csx]
+[tool.briefcase.app.CalcSX_app.document_type.calcsx]
 description = "CalcSX Coil File"
-extension   = "csx"
-icon        = "CalcSX_app/resources/images/csx"
+extension   = "calcsx"
+icon        = "CalcSX_app/resources/images/calcsx"
 url         = "https://calc.sx/csx"
 
 [tool.briefcase.app.CalcSX_app.document_type.bobsx]

@@ -24,7 +24,7 @@ CalcSX™ is a desktop GUI for simulating the electromagnetic and mechanical beh
 | Cross-Section B-Field | 2-D \|B\| heatmap sliced along the axis of symmetry |
 | Coil Generators | Solenoid, Princeton Dee, Saddle, CCT — parametric generators with live preview |
 | Bobbin Import | `.bobsx` groove channel import with surface normals; Fusion 360 exporter included |
-| Session Save/Load | `.csx` files preserve the full coil arrangement, parameters, and transforms |
+| Session Save/Load | `.calcsx` files preserve the full coil arrangement, parameters, and transforms |
 | Transform Gizmo | Translate/rotate handles with seamless coil switching |
 | Dark / Light Themes | Switchable palettes; colormaps, scalar bars, and UI adapt to the active theme |
 | VTK Export | `.vtp` export for ParaView post-processing |
@@ -63,7 +63,7 @@ python -m CalcSX_app.main
 
 | Extension | Description |
 |---|---|
-| `.csx` | CalcSX session — coil coordinates, parameters, transforms, bobbin meshes |
+| `.calcsx` | CalcSX session — coil coordinates, parameters, transforms, bobbin meshes |
 | `.bobsx` | Bobbin groove geometry — centerline, normals, optional mesh (Fusion 360 export) |
 | `.csv` | Coil centerline coordinates (`x,y,z` columns) |
 | `.vtp` | VTK PolyData export for ParaView |
@@ -74,7 +74,7 @@ python -m CalcSX_app.main
 
 | Version | Highlights |
 |---|---|
-| **2.2.0** | Bobbin import; per-vertex force gradient; `.csx` sessions; VTK/web export; Princeton Dee generator; legacy cleanup |
+| **2.2.0** | Bobbin import; per-vertex force gradient; `.calcsx` sessions; VTK/web export; Princeton Dee generator; legacy cleanup |
 | 2.1.0 | Multi-coil superposition; volumetric REBCO model; dark/light themes; global field lines |
 | 2.0.0 | Field lines; cross section; transform gizmo |
 | 1.3.0 | PyVista 3-D backend; CAD workbench |

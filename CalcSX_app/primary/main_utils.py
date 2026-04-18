@@ -16,6 +16,8 @@ Structure
 
 import sys
 import os
+import base64
+import pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -48,6 +50,8 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QProgressDialog,
     QStackedWidget,
+    QRadioButton,
+    QButtonGroup,
 )
 from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal, pyqtSlot, QSize
 from PyQt5.QtGui import QPixmap
@@ -627,6 +631,7 @@ class BrowserPanel(QWidget):
     coil_renamed(id, new_name)            — rename confirmed
     """
     layer_toggled            = pyqtSignal(str, str, bool)   # (coil_id, name, visible)
+    layer_delete_requested   = pyqtSignal(str, str)         # (coil_id, layer_name)
     coil_visibility_toggled  = pyqtSignal(str, bool)
     coil_delete_requested    = pyqtSignal(str)
     coil_selected            = pyqtSignal(str)
@@ -785,7 +790,8 @@ class BrowserPanel(QWidget):
     # ── Public: analysis layers (nested under a coil) ─────────────────────────
 
     def add_layer_to_coil(self, coil_id: str, layer_name: str,
-                          visible: bool = True) -> None:
+                          visible: bool = True,
+                          deletable: bool = False) -> None:
         """Add an analysis layer as a child of the given coil."""
         if coil_id not in self._coil_data:
             return
@@ -819,6 +825,17 @@ class BrowserPanel(QWidget):
         lbl.setObjectName('layer_label')
         lbl.setStyleSheet(f"color:{THEME['text']}; font-size:8pt;")
         lay.addWidget(lbl, stretch=1)
+
+        if deletable:
+            del_btn = QPushButton("×")
+            del_btn.setFixedSize(16, 16)
+            del_btn.setFlat(True)
+            del_btn.setObjectName('coil_del')
+            del_btn.clicked.connect(
+                lambda _, cid=coil_id, n=layer_name:
+                    self.layer_delete_requested.emit(cid, n)
+            )
+            lay.addWidget(del_btn)
 
         self._tree.setItemWidget(child, 0, w)
         child.setSizeHint(0, QSize(0, 22))
@@ -1144,6 +1161,12 @@ class PropertiesPanel(QScrollArea):
         )
         lay.addWidget(self._hdr)
 
+        # ── Coil parameters container (hidden when a probe is selected) ──
+        self._coil_w = QWidget()
+        coil_lay = QVBoxLayout(self._coil_w)
+        coil_lay.setContentsMargins(0, 0, 0, 0)
+        coil_lay.setSpacing(4)
+
         # Coil parameter form
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
@@ -1170,10 +1193,10 @@ class PropertiesPanel(QScrollArea):
         form.addRow("Tape Thick (µm):", self.dspin_thick)
         form.addRow("Tape Width (mm):", self.dspin_width)
         form.addRow("Axis Samples:",    self.spin_axis_pts)
-        lay.addLayout(form)
+        coil_lay.addLayout(form)
 
         # INSPECT — field line seeds
-        lay.addWidget(_hdivider())
+        coil_lay.addWidget(_hdivider())
         irow = QHBoxLayout()
         irow.setContentsMargins(0, 0, 0, 0)
         irow.setSpacing(6)
@@ -1185,7 +1208,7 @@ class PropertiesPanel(QScrollArea):
         self.spin_field_seeds.setValue(24)
         irow.addWidget(ilbl)
         irow.addWidget(self.spin_field_seeds, stretch=1)
-        lay.addLayout(irow)
+        coil_lay.addLayout(irow)
 
         srow = QHBoxLayout()
         srow.setContentsMargins(0, 0, 0, 0)
@@ -1199,7 +1222,14 @@ class PropertiesPanel(QScrollArea):
         self.dspin_cs_offset.setValue(0.0)
         srow.addWidget(slbl)
         srow.addWidget(self.dspin_cs_offset, stretch=1)
-        lay.addLayout(srow)
+        coil_lay.addLayout(srow)
+
+        lay.addWidget(self._coil_w)
+
+        # ── Probe controls (shown only when a Hall probe is selected) ──
+        self._build_probe_controls()
+        lay.addWidget(self._probe_w)
+        self._probe_w.hide()
 
         lay.addWidget(_hdivider())
 
@@ -1215,7 +1245,7 @@ class PropertiesPanel(QScrollArea):
         self._sum_lbls:  dict = {}   # key → value QLabel
         self._sum_keys:  list = []   # key QLabels (for theme refresh)
         for key in ("B cent.", "B axial", "Peak |B|", "Peak F", "Peak σ", "Arc len.",
-                    "Induct.", "Energy"):
+                    "Induct.", "Induct.(vol)", "Energy"):
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(6)
@@ -1236,6 +1266,171 @@ class PropertiesPanel(QScrollArea):
         lay.addWidget(self._sum_w)
 
         lay.addStretch()
+
+    # ── Probe controls ────────────────────────────────────────────────────────
+
+    probe_position_changed = pyqtSignal(float, float, float)  # x, y, z (world, metres)
+    probe_pca_changed      = pyqtSignal(float, float, float)  # u, v, w offsets along PCA axes 1, 2, 3
+    probe_mode_changed     = pyqtSignal(str)                  # 'xyz' or 'pca'
+
+    def _build_probe_controls(self) -> None:
+        self._probe_w = QWidget()
+        pv_lay = QVBoxLayout(self._probe_w)
+        pv_lay.setContentsMargins(0, 0, 0, 0)
+        pv_lay.setSpacing(4)
+
+        hdr = _section_lbl("HALL PROBE")
+        self._probe_hdr = hdr
+        pv_lay.addWidget(hdr)
+
+        self._probe_coil_lbl = QLabel("Coil: —")
+        self._probe_coil_lbl.setObjectName('dim_label')
+        pv_lay.addWidget(self._probe_coil_lbl)
+
+        # Mode toggle (mutually exclusive radios)
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(6)
+        self._probe_mode_grp = QButtonGroup(self._probe_w)
+        self._probe_xyz_radio = QRadioButton("XYZ")
+        self._probe_pca_radio = QRadioButton("PCA axes")
+        self._probe_mode_grp.addButton(self._probe_xyz_radio, 0)
+        self._probe_mode_grp.addButton(self._probe_pca_radio, 1)
+        self._probe_xyz_radio.setChecked(True)
+        mode_row.addWidget(self._probe_xyz_radio)
+        mode_row.addWidget(self._probe_pca_radio)
+        pv_lay.addLayout(mode_row)
+
+        def _mk_coord():
+            s = QDoubleSpinBox()
+            s.setRange(-1e9, 1e9)     # effectively unbounded
+            s.setDecimals(4)
+            s.setSingleStep(0.01)
+            return s
+
+        # XYZ spinboxes
+        self._probe_xyz_w = QWidget()
+        xyz_form = QFormLayout(self._probe_xyz_w)
+        xyz_form.setLabelAlignment(Qt.AlignRight)
+        xyz_form.setSpacing(4)
+        xyz_form.setContentsMargins(0, 0, 0, 0)
+        self.dspin_probe_x = _mk_coord()
+        self.dspin_probe_y = _mk_coord()
+        self.dspin_probe_z = _mk_coord()
+        xyz_form.addRow("X (m):", self.dspin_probe_x)
+        xyz_form.addRow("Y (m):", self.dspin_probe_y)
+        xyz_form.addRow("Z (m):", self.dspin_probe_z)
+        pv_lay.addWidget(self._probe_xyz_w)
+
+        # PCA offset spinboxes (U along axis 1, V along axis 2, W along axis 3)
+        self._probe_pca_w = QWidget()
+        pca_form = QFormLayout(self._probe_pca_w)
+        pca_form.setLabelAlignment(Qt.AlignRight)
+        pca_form.setSpacing(4)
+        pca_form.setContentsMargins(0, 0, 0, 0)
+        self.dspin_probe_u = _mk_coord()
+        self.dspin_probe_v = _mk_coord()
+        self.dspin_probe_w = _mk_coord()
+        pca_form.addRow("Axis 1 (m):", self.dspin_probe_u)
+        pca_form.addRow("Axis 2 (m):", self.dspin_probe_v)
+        pca_form.addRow("Axis 3 (m):", self.dspin_probe_w)
+        pv_lay.addWidget(self._probe_pca_w)
+        self._probe_pca_w.hide()
+
+        # Wire signals
+        self._probe_xyz_radio.toggled.connect(self._on_probe_mode_toggled)
+        for s in (self.dspin_probe_x, self.dspin_probe_y, self.dspin_probe_z):
+            s.valueChanged.connect(self._emit_probe_xyz)
+        for s in (self.dspin_probe_u, self.dspin_probe_v, self.dspin_probe_w):
+            s.valueChanged.connect(self._emit_probe_pca)
+
+    def _on_probe_mode_toggled(self, xyz_checked: bool) -> None:
+        mode = 'xyz' if xyz_checked else 'pca'
+        self._probe_xyz_w.setVisible(mode == 'xyz')
+        self._probe_pca_w.setVisible(mode == 'pca')
+        self.probe_mode_changed.emit(mode)
+
+    def _emit_probe_xyz(self) -> None:
+        self.probe_position_changed.emit(
+            float(self.dspin_probe_x.value()),
+            float(self.dspin_probe_y.value()),
+            float(self.dspin_probe_z.value()),
+        )
+
+    def _emit_probe_pca(self) -> None:
+        self.probe_pca_changed.emit(
+            float(self.dspin_probe_u.value()),
+            float(self.dspin_probe_v.value()),
+            float(self.dspin_probe_w.value()),
+        )
+
+    def show_probe_controls(self, position, mode: str,
+                             coil_ref: str | None,
+                             uvw: tuple) -> None:
+        """Populate + reveal the probe-controls panel."""
+        # Swap panels: show probe UI, hide coil UI, hide summary
+        self._coil_w.hide()
+        self._probe_w.show()
+        self._sum_w.hide()
+
+        controls = (self.dspin_probe_x, self.dspin_probe_y, self.dspin_probe_z,
+                    self.dspin_probe_u, self.dspin_probe_v, self.dspin_probe_w,
+                    self._probe_xyz_radio, self._probe_pca_radio)
+        for s in controls:
+            s.blockSignals(True)
+        try:
+            if position is not None:
+                self.dspin_probe_x.setValue(float(position[0]))
+                self.dspin_probe_y.setValue(float(position[1]))
+                self.dspin_probe_z.setValue(float(position[2]))
+            if uvw is not None:
+                self.dspin_probe_u.setValue(float(uvw[0]))
+                self.dspin_probe_v.setValue(float(uvw[1]))
+                self.dspin_probe_w.setValue(float(uvw[2]))
+            pca_on = (mode == 'pca')
+            self._probe_xyz_radio.setChecked(not pca_on)
+            self._probe_pca_radio.setChecked(pca_on)
+            self._probe_xyz_w.setVisible(not pca_on)
+            self._probe_pca_w.setVisible(pca_on)
+            self._probe_coil_lbl.setText(
+                f"Coil: {coil_ref}" if coil_ref else "Coil: — (select a coil first)"
+            )
+            self._probe_pca_radio.setEnabled(coil_ref is not None)
+        finally:
+            for s in controls:
+                s.blockSignals(False)
+
+    def show_coil_controls(self) -> None:
+        """Swap back to coil-params view (summary visibility is caller's choice)."""
+        self._probe_w.hide()
+        self._coil_w.show()
+
+    def update_probe_position_display(self, position) -> None:
+        """Live-update the XYZ spinboxes without emitting signals (used when
+        gizmo dragging moves the probe)."""
+        if position is None:
+            return
+        for s in (self.dspin_probe_x, self.dspin_probe_y, self.dspin_probe_z):
+            s.blockSignals(True)
+        try:
+            self.dspin_probe_x.setValue(float(position[0]))
+            self.dspin_probe_y.setValue(float(position[1]))
+            self.dspin_probe_z.setValue(float(position[2]))
+        finally:
+            for s in (self.dspin_probe_x, self.dspin_probe_y, self.dspin_probe_z):
+                s.blockSignals(False)
+
+    def update_probe_pca_display(self, u: float, v: float, w: float) -> None:
+        """Update the PCA offset spinboxes without emitting signals."""
+        for s in (self.dspin_probe_u, self.dspin_probe_v, self.dspin_probe_w):
+            s.blockSignals(True)
+        try:
+            self.dspin_probe_u.setValue(float(u))
+            self.dspin_probe_v.setValue(float(v))
+            self.dspin_probe_w.setValue(float(w))
+        finally:
+            for s in (self.dspin_probe_u, self.dspin_probe_v, self.dspin_probe_w):
+                s.blockSignals(False)
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -1300,15 +1495,19 @@ class PropertiesPanel(QScrollArea):
             _set("Arc len.", f"{total:.3f} m")
         except Exception: pass
         # ── New metrics: inductance, Ic, quench ──
+        def _fmt_L(L: float) -> str:
+            if L >= 1.0:
+                return f"{L:.3f} H"
+            if L >= 1e-3:
+                return f"{L*1e3:.3f} mH"
+            return f"{L*1e6:.2f} µH"
         try:
             if engine.self_inductance is not None:
-                L = engine.self_inductance
-                if L >= 1.0:
-                    _set("Induct.", f"{L:.3f} H")
-                elif L >= 1e-3:
-                    _set("Induct.", f"{L*1e3:.3f} mH")
-                else:
-                    _set("Induct.", f"{L*1e6:.2f} µH")
+                _set("Induct.", _fmt_L(engine.self_inductance))
+        except Exception: pass
+        try:
+            Lv = getattr(engine, 'self_inductance_volumetric', None)
+            _set("Induct.(vol)", _fmt_L(Lv) if Lv is not None else "—")
         except Exception: pass
         try:
             if engine.stored_energy is not None:
@@ -1609,7 +1808,6 @@ class MainWindow(QMainWindow):
         self._active_coil_id:    str | None = None
         self._analyzed_coil_id:  str | None = None   # coil that owns the in-progress analysis
         self._coil_engines:      dict       = {}      # coil_id → CoilAnalysis engine
-        self._coil_analysis_cache: dict     = {}      # coil_id → {force_scalars, midpoints, hoop_stress, bfield_axis_z, bfield_axis_mag, axis, mean_point}
         self._coil_inspect_cache:  dict     = {}      # coil_id → {field_lines, field_mags, cross_section}
         self._coil_params_map:   dict       = {}      # coil_id → {winds, current, thickness, width, axis_num}
         self._inspect_coil_id:   str | None = None    # coil being currently inspected
@@ -1622,6 +1820,7 @@ class MainWindow(QMainWindow):
         # Hall probes (multiple)
         self._probe_counter = 0
         self._probe_timer   = None
+        self._probe_state: dict = {}   # probe_id → {mode, coil_ref, uvw, name}
 
         # ── Central widget ────────────────────────────────────────────────────
         central = QWidget()
@@ -1677,6 +1876,7 @@ class MainWindow(QMainWindow):
         self.browser.layer_toggled.connect(self.workspace.set_layer_visible)
         self.browser.coil_visibility_toggled.connect(self.workspace.set_coil_visible)
         self.browser.coil_delete_requested.connect(self._on_coil_delete)
+        self.browser.layer_delete_requested.connect(self._on_layer_delete)
         self.browser.coil_selected.connect(self._on_coil_selected)
         self.browser.coil_renamed.connect(self._on_coil_renamed)
         self.browser.coil_recolored.connect(self._on_coil_recolored)
@@ -1689,6 +1889,9 @@ class MainWindow(QMainWindow):
         self.browser.probe_recolored.connect(
             lambda pid, c: self.workspace.set_probe_color(pid, c)
         )
+        self.props.probe_position_changed.connect(self._on_probe_xyz_edit)
+        self.props.probe_pca_changed.connect(self._on_probe_pca_edit)
+        self.props.probe_mode_changed.connect(self._on_probe_mode_change)
         self.workspace.set_stale_callback(self._on_layers_stale)
 
         # Listen to per-coil parameter changes → mark active coil stale
@@ -1945,7 +2148,6 @@ class MainWindow(QMainWindow):
         # Clear analysis layers and engine for this coil
         self.workspace.clear_analysis_layers(coil_id)
         self._coil_engines.pop(coil_id, None)
-        self._coil_analysis_cache.pop(coil_id, None)
         self._coil_inspect_cache.pop(coil_id, None)
         self._multi_env.unregister_coil(coil_id)
         self._propagate_staleness()
@@ -1966,29 +2168,34 @@ class MainWindow(QMainWindow):
             self.ribbon.set_construct_enabled(False)
             self.ribbon.set_inspect_enabled(False)
 
+    def _on_layer_delete(self, coil_id: str, layer_name: str) -> None:
+        """Delete a user-created sub-layer (Cross Section or Field Lines)."""
+        if layer_name == 'Cross Section':
+            self.workspace.clear_cross_section_layer(coil_id)
+            self.browser.remove_layer_from_coil(coil_id, 'Cross Section')
+            ic = self._coil_inspect_cache.get(coil_id)
+            if ic is not None:
+                ic.pop('cross_section', None)
+                if not ic:
+                    self._coil_inspect_cache.pop(coil_id, None)
+        elif layer_name == 'Field Lines':
+            self.workspace.clear_field_lines_layer(coil_id)
+            self.browser.remove_layer_from_coil(coil_id, 'Field Lines')
+            ic = self._coil_inspect_cache.get(coil_id)
+            if ic is not None:
+                ic.pop('field_lines', None)
+                ic.pop('field_mags', None)
+                ic.pop('field_seeds', None)
+                if not ic:
+                    self._coil_inspect_cache.pop(coil_id, None)
+            # Re-unify the remaining field-line scale bar
+            self.workspace.rescale_all_field_line_layers()
+
     def _refresh_summary_for(self, coil_id: str) -> None:
-        """Populate the Properties summary for *coil_id* from the live
-        engine if present, otherwise from the cached analysis results."""
+        """Populate the Properties summary from the coil's engine, if any."""
         engine = self._coil_engines.get(coil_id)
         if engine is not None:
             self.props.update_summary(engine)
-            return
-        ac = self._coil_analysis_cache.get(coil_id)
-        if not ac:
-            return
-        from types import SimpleNamespace
-        ns = SimpleNamespace(
-            B_magnitude=ac.get('B_magnitude'),
-            B_axial=ac.get('B_axial'),
-            bfield_axis_mag=ac.get('bfield_axis_mag'),
-            bfield_axis_z=ac.get('bfield_axis_z'),
-            F_mags=ac.get('F_mags'),
-            hoop_stress=ac.get('hoop_stress'),
-            coords=self._coil_coords.get(coil_id),
-            self_inductance=ac.get('self_inductance'),
-            stored_energy=ac.get('stored_energy'),
-        )
-        self.props.update_summary(ns)
 
     def _on_coil_selected(self, coil_id: str) -> None:
         # Save current coil's spinbox values before switching
@@ -1999,6 +2206,8 @@ class MainWindow(QMainWindow):
         self._coords = self._coil_coords.get(coil_id)
         # Switch gizmo target back to coil
         self.workspace.set_gizmo_target('coil')
+        # Swap Properties back to coil view
+        self.props.show_coil_controls()
         # Load the new coil's params into spinboxes
         self._load_coil_params(coil_id)
         self.workspace.set_active_coil(coil_id)
@@ -2133,7 +2342,7 @@ class MainWindow(QMainWindow):
         def _force_progress(done, total):
             self.reporter.report(87 + int(8 * done / max(total, 1)))
 
-        force_scalars = self.workspace.add_force_layer(
+        self.workspace.add_force_layer(
             engine, cid, progress_callback=_force_progress,
         )
 
@@ -2142,31 +2351,6 @@ class MainWindow(QMainWindow):
 
         self.workspace.add_stress_layer(engine, cid)
         self.workspace.add_axis_layer(engine, cid)
-
-        # Cache arrays needed to restore these layers from a saved session
-        self._coil_analysis_cache[cid] = {
-            'force_scalars':   force_scalars,
-            'midpoints':       np.asarray(engine.midpoints, dtype=float),
-            'hoop_stress':     np.asarray(engine.hoop_stress, dtype=float),
-            'F_mags':          (np.asarray(engine.F_mags, dtype=float)
-                                if getattr(engine, 'F_mags', None) is not None else None),
-            'bfield_axis_z':   (np.asarray(engine.bfield_axis_z, dtype=float)
-                                if engine.bfield_axis_z is not None else None),
-            'bfield_axis_mag': (np.asarray(engine.bfield_axis_mag, dtype=float)
-                                if engine.bfield_axis_mag is not None else None),
-            'axis':            np.asarray(engine.axis, dtype=float),
-            'mean_point':      np.asarray(engine.mean_point, dtype=float),
-            'B_total':         (np.asarray(engine.B_total, dtype=float)
-                                if getattr(engine, 'B_total', None) is not None else None),
-            'B_magnitude':     (float(engine.B_magnitude)
-                                if getattr(engine, 'B_magnitude', None) is not None else None),
-            'B_axial':         (float(engine.B_axial)
-                                if getattr(engine, 'B_axial', None) is not None else None),
-            'self_inductance': (float(engine.self_inductance)
-                                if getattr(engine, 'self_inductance', None) is not None else None),
-            'stored_energy':   (float(engine.stored_energy)
-                                if getattr(engine, 'stored_energy', None) is not None else None),
-        }
 
         # Unify force colour scale — defer during re-analyze-all so the
         # global range accounts for ALL coils, not just those done so far.
@@ -2313,6 +2497,27 @@ class MainWindow(QMainWindow):
             self._analysis_auto_triggered = True
             self._on_run_analysis()
             return
+        # Reuse cached field lines when the coil is fresh and the seed
+        # count matches — matches the "persistent" behaviour of Global Field.
+        ic = self._coil_inspect_cache.get(cid, {})
+        stale_cids = set(self._multi_env.get_stale_coils())
+        cached_seeds = ic.get('field_seeds')
+        n_seeds = int(self.props.get_field_seeds())
+        have_lines = ic.get('field_lines') is not None
+        have_mags  = ic.get('field_mags')  is not None
+        # If seeds weren't recorded (older session file), assume the current
+        # UI value is the user's intent; otherwise require an exact match.
+        seeds_ok = (cached_seeds is None) or (cached_seeds == n_seeds)
+        if (cid not in stale_cids and have_lines and have_mags and seeds_ok):
+            lines  = ic['field_lines']
+            B_mags = ic['field_mags']
+            self.workspace.add_field_lines_layer(lines, B_mags, cid)
+            self.workspace.rescale_all_field_line_layers()
+            self.browser.add_layer_to_coil(cid, 'Field Lines', deletable=True)
+            if self.ribbon._btn_global_field.isChecked():
+                self.workspace.set_layer_visible(cid, 'Field Lines', False)
+                self.browser.set_layer_eye_locked(cid, 'Field Lines', locked=True)
+            return
         self._run_field_lines_for(cid, engine)
 
     def _run_field_lines_for(self, cid: str, engine) -> None:
@@ -2348,7 +2553,8 @@ class MainWindow(QMainWindow):
             cache = self._coil_inspect_cache.setdefault(cid, {})
             cache['field_lines'] = [np.asarray(l, dtype=float) for l in lines]
             cache['field_mags']  = [np.asarray(m, dtype=float) for m in B_mags]
-            self.browser.add_layer_to_coil(cid, 'Field Lines')
+            cache['field_seeds'] = int(self.props.get_field_seeds())
+            self.browser.add_layer_to_coil(cid, 'Field Lines', deletable=True)
             # If global field mode is active, hide per-coil lines immediately
             if self.ribbon._btn_global_field.isChecked():
                 self.workspace.set_layer_visible(cid, 'Field Lines', False)
@@ -2363,6 +2569,23 @@ class MainWindow(QMainWindow):
             self._pending_inspect = 'cross_section'
             self._analysis_auto_triggered = True
             self._on_run_analysis()
+            return
+        # Reuse cached cross section when the coil is fresh and the
+        # section-offset matches the current UI value.
+        ic = self._coil_inspect_cache.get(cid, {})
+        stale_cids = set(self._multi_env.get_stale_coils())
+        cs_cache = ic.get('cross_section')
+        cur_offset = float(self.props.get_cs_offset())
+        cached_offset = cs_cache.get('offset') if cs_cache else None
+        # Treat a missing cached offset (older sessions) as a match.
+        offset_ok = (cached_offset is None) or (abs(cached_offset - cur_offset) < 1e-9)
+        if cid not in stale_cids and cs_cache is not None and offset_ok:
+            self.workspace.add_cross_section_layer(
+                cs_cache['X'], cs_cache['Y'], cs_cache['B_plane'],
+                cs_cache['e1'], cs_cache['e2'], cs_cache['center'],
+                cs_cache['R'], cid,
+            )
+            self.browser.add_layer_to_coil(cid, 'Cross Section', deletable=True)
             return
         self._run_cross_section_for(cid, engine)
 
@@ -2403,8 +2626,9 @@ class MainWindow(QMainWindow):
                 'e2': np.asarray(e2, dtype=float),
                 'center': np.asarray(center, dtype=float),
                 'R': float(R),
+                'offset': float(self.props.get_cs_offset()),
             }
-            self.browser.add_layer_to_coil(cid, 'Cross Section')
+            self.browser.add_layer_to_coil(cid, 'Cross Section', deletable=True)
 
     def _on_translate_toggled(self, checked: bool) -> None:
         if checked:
@@ -2552,10 +2776,17 @@ class MainWindow(QMainWindow):
         self._coil_names.clear()
         self._coil_params_map.clear()
         self._coil_engines.clear()
-        self._coil_analysis_cache.clear()
         self._coil_inspect_cache.clear()
         self._global_fl_cache = None
         self._global_fl_dirty = True
+        # Remove all Hall probes
+        for pid in list(self.workspace._probe_entries.keys()):
+            self.workspace.remove_hall_probe(pid)
+            self.browser.remove_probe_item(pid)
+        self._probe_state.clear()
+        if self._probe_timer is not None:
+            self._probe_timer.stop()
+            self._probe_timer = None
         self._multi_env = MultiCoilEnvironment()
         self._active_coil_id = None
         self._analyzed_coil_id = None
@@ -2569,12 +2800,12 @@ class MainWindow(QMainWindow):
             self.workspace._plotter.render()
 
     def _save_session(self, parent=None) -> None:
-        """Export coil arrangement to a .csx file for later reload."""
+        """Export coil arrangement to a .calcsx file for later reload."""
         import json
         parent = parent or self
         path, _ = QFileDialog.getSaveFileName(
-            parent, "Save Session", "session.csx",
-            "CalcSX Session (*.csx)",
+            parent, "Save Session", "session.calcsx",
+            "CalcSX Session (*.calcsx)",
         )
         if not path:
             return
@@ -2596,14 +2827,27 @@ class MainWindow(QMainWindow):
             save_params = {k: _jsonable(v) for k, v in raw_params.items()}
             coords = self._coil_coords[coil_id]
 
-            # Serialize cached analysis results (None if not yet analyzed)
-            ac = self._coil_analysis_cache.get(coil_id)
-            if ac is not None:
-                analysis = {k: _jsonable(v) for k, v in ac.items() if v is not None}
-            else:
-                analysis = None
+            # Pickle the full CoilAnalysis engine (with the B_ext closure
+            # nulled, since it references MultiCoilEnvironment and isn't
+            # meaningfully picklable). B_ext is re-attached on load.
+            engine_b64 = None
+            engine = self._coil_engines.get(coil_id)
+            if engine is not None:
+                saved_B_ext = getattr(engine, '_B_ext', None)
+                try:
+                    engine._B_ext = None
+                    engine_b64 = base64.b64encode(
+                        pickle.dumps(engine, protocol=pickle.HIGHEST_PROTOCOL)
+                    ).decode('ascii')
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[save_session] engine pickle failed for {coil_id}: "
+                        f"{type(exc).__name__}: {exc}\n"
+                    )
+                finally:
+                    engine._B_ext = saved_B_ext
 
-            # Serialize cached inspection results
+            # Serialize cached inspection results (field lines, cross section)
             ic = self._coil_inspect_cache.get(coil_id)
             inspect = None
             if ic is not None:
@@ -2611,6 +2855,8 @@ class MainWindow(QMainWindow):
                 if 'field_lines' in ic and 'field_mags' in ic:
                     inspect['field_lines'] = [np.asarray(l).tolist() for l in ic['field_lines']]
                     inspect['field_mags']  = [np.asarray(m).tolist() for m in ic['field_mags']]
+                    if 'field_seeds' in ic:
+                        inspect['field_seeds'] = int(ic['field_seeds'])
                 if 'cross_section' in ic:
                     cs = ic['cross_section']
                     inspect['cross_section'] = {k: _jsonable(v) for k, v in cs.items()}
@@ -2625,7 +2871,7 @@ class MainWindow(QMainWindow):
                 'coords':     coords.tolist(),
                 'params':     save_params,
                 'xfm_params': list(entry['xfm_params']) if entry.get('xfm_params') else None,
-                'analysis':   analysis,
+                'engine_b64': engine_b64,
                 'inspect':    inspect,
             })
 
@@ -2663,27 +2909,54 @@ class MainWindow(QMainWindow):
                 'seeds':  int(getattr(self, '_global_fl_cache_seeds', 0)),
             }
 
+        # ── Serialize Hall probes ──
+        probes = []
+        for pid, entry in self.workspace._probe_entries.items():
+            pos = self.workspace.get_probe_position(pid)
+            st = self._probe_state.get(pid, {})
+            uvw = st.get('uvw') or (0.0, 0.0, 0.0)
+            probes.append({
+                'probe_id': pid,
+                'name':     st.get('name', pid),
+                'color':    entry.get('color'),
+                'position': list(map(float, (pos if pos is not None else entry['position']))),
+                'mode':     st.get('mode', 'xyz'),
+                'coil_ref': st.get('coil_ref'),
+                'uvw':      [float(uvw[0]), float(uvw[1]), float(uvw[2])],
+            })
+
         with open(path, 'w') as f:
             json.dump({
                 'version': 3,
                 'coils': coils,
                 'bobbins': bobbins,
                 'global_field_lines': global_fl,
+                'hall_probes': probes,
             }, f, indent=2)
 
-        n_total = len(coils) + len(bobbins)
+        n_xsec = sum(
+            1 for c in self._coil_inspect_cache.values()
+            if 'cross_section' in c
+        )
+        parts = [f"{len(coils)} coil(s)"]
+        if bobbins:
+            parts.append(f"{len(bobbins)} bobbin(s)")
+        if probes:
+            parts.append(f"{len(probes)} probe(s)")
+        if n_xsec:
+            parts.append(f"{n_xsec} cross section(s)")
         QMessageBox.information(
             parent, "Session Saved",
-            f"Saved {len(coils)} coil(s) and {len(bobbins)} bobbin(s) to:\n{path}",
+            f"Saved {', '.join(parts)} to:\n{path}",
         )
 
     def _load_session(self, parent=None) -> None:
-        """Restore a coil arrangement from a previously saved .csx session."""
+        """Restore a coil arrangement from a previously saved .calcsx session."""
         import json
         parent = parent or self
         path, _ = QFileDialog.getOpenFileName(
             parent, "Load Session", "",
-            "CalcSX Session (*.csx);;JSON files (*.json)",
+            "CalcSX Session (*.calcsx);;JSON files (*.json)",
         )
         if not path:
             return
@@ -2704,10 +2977,23 @@ class MainWindow(QMainWindow):
         # Clear the entire workspace before loading
         self._clear_all()
 
+        # ── Loading progress dialog ──
+        coil_entries = list(data.get('coils', []))
+        bobbin_entries = list(data.get('bobbins') or [])
+        probe_entries  = list(data.get('hall_probes') or [])
+        n_coils   = len(coil_entries)
+        n_bobbins_planned = len(bobbin_entries)
+        n_probes_planned  = len(probe_entries)
+        self._load_reporter = ProgressReporter(self, title="Loading Session…")
+        self._load_reporter.start()
+        self._load_reporter.set_stage("Loading coils…")
+        self._load_reporter.report(0)
+        QApplication.processEvents()
+
         file_ver = data.get('version', 1)
         failed = []
         loaded = 0
-        for entry in data.get('coils', []):
+        for entry in coil_entries:
             # ── Resolve coordinates ──
             # v2+: coords embedded; v1 fallback: read from CSV
             if 'coords' in entry:
@@ -2791,52 +3077,29 @@ class MainWindow(QMainWindow):
                 if wc is not None:
                     self._multi_env.update_coil_coords(coil_id, wc)
 
-            # ── Restore saved analysis layers (v3+) ──
-            analysis = entry.get('analysis')
-            if analysis:
-                cache = {}
-                fs = analysis.get('force_scalars')
-                if fs is not None:
-                    fs_np = np.asarray(fs, dtype=np.float32)
-                    self.workspace.add_force_layer_from_scalars(coil_id, fs_np)
+            # ── Restore the full engine from pickle (if saved) ──
+            engine_b64 = entry.get('engine_b64')
+            if engine_b64:
+                try:
+                    engine = pickle.loads(base64.b64decode(engine_b64))
+                    engine._B_ext = self._multi_env.make_external_field_func(coil_id)
+                    self._coil_engines[coil_id] = engine
+                    # Rebuild the standard analysis layers from the engine
+                    self.workspace.add_force_layer(engine, coil_id)
+                    self.workspace.add_stress_layer(engine, coil_id)
+                    self.workspace.add_axis_layer(engine, coil_id)
                     self.browser.add_layer_to_coil(coil_id, 'Forces')
-                    cache['force_scalars'] = fs_np
-                mp = analysis.get('midpoints'); hs = analysis.get('hoop_stress')
-                if mp is not None and hs is not None:
-                    mp_np = np.asarray(mp, dtype=float)
-                    hs_np = np.asarray(hs, dtype=float)
-                    self.workspace.add_stress_layer_from_data(coil_id, mp_np, hs_np)
                     self.browser.add_layer_to_coil(coil_id, 'Stress')
-                    cache['midpoints']   = mp_np
-                    cache['hoop_stress'] = hs_np
-                bz = analysis.get('bfield_axis_z'); bm = analysis.get('bfield_axis_mag')
-                if bz is not None and bm is not None:
-                    bz_np = np.asarray(bz, dtype=float)
-                    bm_np = np.asarray(bm, dtype=float)
-                    ax_np = np.asarray(analysis.get('axis', [0, 0, 1]), dtype=float)
-                    mp_np = np.asarray(analysis.get('mean_point', [0, 0, 0]), dtype=float)
-                    self.workspace.add_axis_layer_from_data(
-                        coil_id, bz_np, bm_np, ax_np, mp_np,
-                    )
                     self.browser.add_layer_to_coil(coil_id, 'B Axis')
-                    cache.update({
-                        'bfield_axis_z': bz_np, 'bfield_axis_mag': bm_np,
-                        'axis': ax_np, 'mean_point': mp_np,
-                    })
-                # Restore centroid B-field and scalar summary metrics
-                fmags = analysis.get('F_mags')
-                if fmags is not None:
-                    cache['F_mags'] = np.asarray(fmags, dtype=float)
-                bt = analysis.get('B_total')
-                if bt is not None:
-                    cache['B_total'] = np.asarray(bt, dtype=float)
-                for k in ('B_magnitude', 'B_axial', 'self_inductance', 'stored_energy'):
-                    if analysis.get(k) is not None:
-                        cache[k] = float(analysis[k])
-                if cache:
-                    self._coil_analysis_cache[coil_id] = cache
-                    # Also re-apply the coil's current transform to the new layers
+                    # Re-apply the coil's transform to the new layers
                     self.workspace.reapply_coil_transform(coil_id)
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[load_session] engine unpickle failed for {coil_id}: "
+                        f"{type(exc).__name__}: {exc}\n"
+                    )
+                    import traceback
+                    traceback.print_exc()
 
             # ── Restore saved inspection layers (field lines, cross section) ──
             inspect = entry.get('inspect')
@@ -2847,9 +3110,11 @@ class MainWindow(QMainWindow):
                     lines  = [np.asarray(l, dtype=float) for l in fl]
                     B_mags = [np.asarray(m, dtype=float) for m in fm]
                     self.workspace.add_field_lines_layer(lines, B_mags, coil_id)
-                    self.browser.add_layer_to_coil(coil_id, 'Field Lines')
+                    self.browser.add_layer_to_coil(coil_id, 'Field Lines', deletable=True)
                     ic['field_lines'] = lines
                     ic['field_mags']  = B_mags
+                    if inspect.get('field_seeds') is not None:
+                        ic['field_seeds'] = int(inspect['field_seeds'])
                 cs = inspect.get('cross_section')
                 if cs:
                     X  = np.asarray(cs['X'], dtype=float)
@@ -2862,19 +3127,28 @@ class MainWindow(QMainWindow):
                     self.workspace.add_cross_section_layer(
                         X, Y, Bp, e1, e2, ct, R, coil_id,
                     )
-                    self.browser.add_layer_to_coil(coil_id, 'Cross Section')
+                    self.browser.add_layer_to_coil(coil_id, 'Cross Section', deletable=True)
                     ic['cross_section'] = {
                         'X': X, 'Y': Y, 'B_plane': Bp,
                         'e1': e1, 'e2': e2, 'center': ct, 'R': R,
+                        'offset': float(cs.get('offset', 0.0)),
                     }
                 if ic:
                     self._coil_inspect_cache[coil_id] = ic
 
             loaded += 1
+            # Coils drive the bulk of load time — give them 0..80% of the bar
+            if n_coils:
+                self._load_reporter.report(int(80 * loaded / n_coils))
+            QApplication.processEvents()
 
         # ── Restore bobbin meshes ──
+        if n_bobbins_planned:
+            self._load_reporter.set_stage("Loading bobbins…")
+            self._load_reporter.report(82)
+            QApplication.processEvents()
         n_bobbins = 0
-        for bentry in data.get('bobbins', []):
+        for bentry in bobbin_entries:
             try:
                 import pyvista as pv
                 bid = bentry['bobbin_id']
@@ -2891,8 +3165,8 @@ class MainWindow(QMainWindow):
                 pass
 
         self._propagate_staleness()
-        # Any coil whose analysis cache was restored is considered fresh
-        for cid in self._coil_analysis_cache:
+        # Any coil whose full engine was restored is considered fresh
+        for cid in self._coil_engines:
             self._multi_env.mark_fresh(cid)
             for nm in ('Forces', 'Stress', 'B Axis', 'Field Lines', 'Cross Section'):
                 self.browser.mark_layer_stale(cid, nm, False)
@@ -2903,6 +3177,9 @@ class MainWindow(QMainWindow):
             'field_lines' in c for c in self._coil_inspect_cache.values()
         )
         if gfl and gfl.get('lines') and gfl.get('B_mags'):
+            self._load_reporter.set_stage("Restoring global field lines…")
+            self._load_reporter.report(90)
+            QApplication.processEvents()
             lines  = [np.asarray(l, dtype=float) for l in gfl['lines']]
             B_mags = [np.asarray(m, dtype=float) for m in gfl['B_mags']]
             self._global_fl_cache = (lines, B_mags)
@@ -2911,8 +3188,56 @@ class MainWindow(QMainWindow):
             self.workspace.add_field_lines_layer(lines, B_mags, '__global__')
             any_field_lines_restored = True
 
+        # ── Restore Hall probes ──
+        if n_probes_planned:
+            self._load_reporter.set_stage("Restoring Hall probes…")
+            self._load_reporter.report(95)
+            QApplication.processEvents()
+        probes_data = probe_entries
+        n_probes = 0
+        max_probe_counter = self._probe_counter
+        for pentry in probes_data:
+            try:
+                pid     = pentry['probe_id']
+                name    = pentry.get('name', pid)
+                color   = pentry.get('color')
+                position = np.asarray(pentry['position'], dtype=np.float64)
+                mode    = pentry.get('mode', 'xyz')
+                coil_ref = pentry.get('coil_ref')
+                uvw_raw  = pentry.get('uvw') or (0.0, 0.0, 0.0)
+                uvw      = (float(uvw_raw[0]), float(uvw_raw[1]), float(uvw_raw[2]))
+                self.workspace.add_hall_probe(pid, position, color=color)
+                self.browser.add_probe_item(pid, name)
+                self._probe_state[pid] = {
+                    'mode':     mode,
+                    'coil_ref': coil_ref,
+                    'uvw':      uvw,
+                    'name':     name,
+                }
+                # Bump counter past the loaded probe's numeric id so newly
+                # created probes don't collide.
+                try:
+                    n = int(pid.rsplit('_', 1)[-1])
+                    max_probe_counter = max(max_probe_counter, n)
+                except ValueError:
+                    pass
+                n_probes += 1
+            except Exception:
+                pass
+        self._probe_counter = max_probe_counter
+        # Start the probe readout timer if any probes were restored
+        if n_probes and self._probe_timer is None:
+            from PyQt5.QtCore import QTimer
+            self._probe_timer = QTimer(self)
+            self._probe_timer.setInterval(200)
+            self._probe_timer.timeout.connect(self._update_all_probe_readouts)
+            self._probe_timer.start()
+
         # Unify colour scales across restored layers
-        if self._coil_analysis_cache:
+        self._load_reporter.set_stage("Finalizing…")
+        self._load_reporter.report(99)
+        QApplication.processEvents()
+        if self._coil_engines:
             self.workspace.rescale_all_force_layers()
         if any_field_lines_restored:
             self.workspace.rescale_all_field_line_layers()
@@ -2925,11 +3250,21 @@ class MainWindow(QMainWindow):
         if self.workspace._plotter:
             self.workspace._plotter.reset_camera()
             self.workspace._plotter.render()
+        self._load_reporter.finish()
+        self._load_reporter = None
 
-        msg = f"Loaded {loaded} coil(s)"
+        n_xsec_loaded = sum(
+            1 for c in self._coil_inspect_cache.values()
+            if 'cross_section' in c
+        )
+        parts = [f"{loaded} coil(s)"]
         if n_bobbins:
-            msg += f" and {n_bobbins} bobbin(s)"
-        msg += "."
+            parts.append(f"{n_bobbins} bobbin(s)")
+        if n_probes:
+            parts.append(f"{n_probes} probe(s)")
+        if n_xsec_loaded:
+            parts.append(f"{n_xsec_loaded} cross section(s)")
+        msg = "Loaded " + ", ".join(parts) + "."
         if failed:
             msg += f"\n\nFailed to load {len(failed)} coil(s):\n" + "\n".join(failed)
         QMessageBox.information(self, "Session Loaded", msg)
@@ -2972,6 +3307,15 @@ class MainWindow(QMainWindow):
         self.workspace.add_hall_probe(probe_id, position)
         self.browser.add_probe_item(probe_id, f"Probe {self._probe_counter}")
 
+        # Initialize probe metadata: default XYZ mode, associated with the
+        # currently active coil (so PCA mode is available).
+        self._probe_state[probe_id] = {
+            'mode':     'xyz',
+            'coil_ref': self._active_coil_id,
+            'uvw':      (0.0, 0.0, 0.0),
+            'name':     f"Probe {self._probe_counter}",
+        }
+
         # Start the shared readout timer if not already running
         if self._probe_timer is None:
             self._probe_timer = QTimer(self)
@@ -2991,6 +3335,23 @@ class MainWindow(QMainWindow):
         pos = self.workspace.get_probe_position(probe_id)
         if pos is None:
             return
+        # Reflect gizmo-driven moves in the Properties spinboxes — but not
+        # while the user is actively editing them.
+        if probe_id == self._active_probe_id() and self.props._probe_w.isVisible():
+            if not any(s.hasFocus() for s in (
+                self.props.dspin_probe_x,
+                self.props.dspin_probe_y,
+                self.props.dspin_probe_z,
+                self.props.dspin_probe_u,
+                self.props.dspin_probe_v,
+                self.props.dspin_probe_w,
+            )):
+                self.props.update_probe_position_display(pos)
+                st = self._probe_state.get(probe_id, {})
+                if st.get('mode') == 'pca' and st.get('coil_ref'):
+                    uvw = self._xyz_to_pca(st['coil_ref'], pos)
+                    st['uvw'] = uvw
+                    self.props.update_probe_pca_display(*uvw)
         B_func = self._multi_env.make_total_field_func()
         if B_func is None:
             # No field available yet — show position only
@@ -3027,16 +3388,122 @@ class MainWindow(QMainWindow):
             mode = 'T' if self.ribbon._btn_translate.isChecked() else 'R'
             self.workspace.show_gizmo(mode)
         self._update_single_probe_readout(probe_id)
+        # Show the probe-controls view in the Properties panel
+        st = self._probe_state.setdefault(probe_id, {
+            'mode': 'xyz', 'coil_ref': self._active_coil_id,
+            'uvw': (0.0, 0.0, 0.0), 'name': probe_id,
+        })
+        coil_ref = st.get('coil_ref') or self._active_coil_id
+        st['coil_ref'] = coil_ref
+        uvw = st.get('uvw') or (0.0, 0.0, 0.0)
+        # If we have a coil reference, refresh UVW to match the current XYZ
+        # so the display is coherent even when the probe was moved via gizmo.
+        if coil_ref and pos is not None:
+            uvw = self._xyz_to_pca(coil_ref, pos)
+            st['uvw'] = uvw
+        self.props.show_probe_controls(
+            position=pos, mode=st['mode'], coil_ref=coil_ref, uvw=uvw,
+        )
 
     def _on_probe_delete(self, probe_id: str) -> None:
         """Delete a specific Hall probe."""
         self.workspace.remove_hall_probe(probe_id)
         self.browser.remove_probe_item(probe_id)
+        self._probe_state.pop(probe_id, None)
         # Stop timer if no probes remain
         if not self.workspace._probe_entries:
             if self._probe_timer is not None:
                 self._probe_timer.stop()
                 self._probe_timer = None
+        # If no probes remain, return to coil view
+        if not self.workspace._probe_entries:
+            self.props.show_coil_controls()
+
+    # ── Probe position handlers ──────────────────────────────────────────────
+
+    def _coil_pca_frame(self, coil_id: str):
+        """Return (mean, axes) where axes is a (3, 3) matrix with the coil's
+        three PCA component vectors as rows (in order of descending variance),
+        computed from the current world-space coords. None on failure."""
+        from sklearn.decomposition import PCA
+        coords = self.workspace.get_transformed_coords(coil_id)
+        if coords is None:
+            coords = self._coil_coords.get(coil_id)
+        if coords is None or len(coords) < 3:
+            return None
+        coords = np.asarray(coords, dtype=float)
+        try:
+            pca = PCA(n_components=3).fit(coords)
+            axes = np.asarray(pca.components_, dtype=float)
+            mean = np.asarray(pca.mean_,       dtype=float)
+            return mean, axes
+        except Exception:
+            return None
+
+    def _xyz_to_pca(self, coil_id: str, position) -> tuple:
+        """Project a world-space position onto the coil's PCA frame; returns
+        (u, v, w) offsets along axis 1, 2, 3 from the coil centroid."""
+        frame = self._coil_pca_frame(coil_id)
+        if frame is None:
+            return (0.0, 0.0, 0.0)
+        mean, axes = frame
+        d = np.asarray(position, dtype=float) - mean
+        return (float(d @ axes[0]), float(d @ axes[1]), float(d @ axes[2]))
+
+    def _pca_to_xyz(self, coil_id: str, uvw) -> np.ndarray | None:
+        """Convert PCA offsets (u, v, w) to a world-space position."""
+        frame = self._coil_pca_frame(coil_id)
+        if frame is None:
+            return None
+        mean, axes = frame
+        u, v, w = float(uvw[0]), float(uvw[1]), float(uvw[2])
+        return mean + u * axes[0] + v * axes[1] + w * axes[2]
+
+    def _active_probe_id(self) -> str | None:
+        return self.workspace._active_probe_id
+
+    def _on_probe_xyz_edit(self, x: float, y: float, z: float) -> None:
+        pid = self._active_probe_id()
+        if pid is None:
+            return
+        self.workspace.set_probe_position(pid, np.array([x, y, z], dtype=float))
+        # In PCA mode, also refresh the U/V/W spinboxes to reflect the new XYZ.
+        st = self._probe_state.get(pid, {})
+        if st.get('mode') == 'pca' and st.get('coil_ref'):
+            uvw = self._xyz_to_pca(st['coil_ref'], [x, y, z])
+            st['uvw'] = uvw
+            self.props.update_probe_pca_display(*uvw)
+        self._update_single_probe_readout(pid)
+
+    def _on_probe_pca_edit(self, u: float, v: float, w: float) -> None:
+        pid = self._active_probe_id()
+        if pid is None:
+            return
+        st = self._probe_state.get(pid, {})
+        coil_ref = st.get('coil_ref')
+        if not coil_ref:
+            return
+        pt = self._pca_to_xyz(coil_ref, (u, v, w))
+        if pt is None:
+            return
+        st['uvw'] = (float(u), float(v), float(w))
+        self.workspace.set_probe_position(pid, pt)
+        self.props.update_probe_position_display(pt)
+        self._update_single_probe_readout(pid)
+
+    def _on_probe_mode_change(self, mode: str) -> None:
+        pid = self._active_probe_id()
+        if pid is None:
+            return
+        st = self._probe_state.setdefault(pid, {})
+        st['mode'] = mode
+        # When switching to PCA, refresh the UVW spinboxes from current XYZ.
+        if mode == 'pca' and st.get('coil_ref'):
+            pos = self.workspace.get_probe_position(pid)
+            if pos is not None:
+                uvw = self._xyz_to_pca(st['coil_ref'], pos)
+                st['uvw'] = uvw
+                self.props.update_probe_pca_display(*uvw)
 
     def _propagate_staleness(self) -> None:
         """Reflect MultiCoilEnvironment staleness into browser stale markers."""

@@ -52,8 +52,9 @@ class CoilAnalysis:
         self._fil_dl      = None
         self._fil_mid     = None
         # Inductance (populated post-analysis)
-        self.self_inductance = None   # H
-        self.stored_energy   = None   # J
+        self.self_inductance            = None   # H — Neumann filamentary, primary value
+        self.self_inductance_volumetric = None   # H — energy-integral, for comparison
+        self.stored_energy              = None   # J
 
 
     def run_analysis(self, compute_bfield=False, use_gauss=False,
@@ -202,8 +203,23 @@ class CoilAnalysis:
             self._compute_self_inductance()
         except Exception:
             pass
+        # Volumetric energy-integral inductance — stored alongside the
+        # Neumann value for comparison, but does NOT overwrite it.
+        # Accuracy depends on grid density; grid=20 is fast but coarse
+        # and may underestimate |B|² near thick cross-sections.
+        def _L_progress(pct: int) -> None:
+            if progress_callback:
+                progress_callback(98 + max(0, min(1, pct // 100)))
+        try:
+            L_vol = self._compute_self_inductance_volumetric(
+                progress_callback=_L_progress,
+            )
+            if L_vol is not None and np.isfinite(L_vol):
+                self.self_inductance_volumetric = float(L_vol)
+        except Exception:
+            pass
         if progress_callback:
-            progress_callback(98)
+            progress_callback(99)
 
         # 9) Done -> 100%
         _stage("Finalizing")
@@ -1362,6 +1378,92 @@ class CoilAnalysis:
 
         self.self_inductance = float(L)
         self.stored_energy = 0.5 * L * self.current * self.current
+
+    def _compute_self_inductance_volumetric(self, grid: int = 20,
+                                              margin: float = 2.0,
+                                              core_radius: float = 1e-3,
+                                              progress_callback=None):
+        """
+        Self-inductance from the volume integral of magnetic energy density.
+
+            L = (1 / (µ₀ I²)) ∫ |B|² dV
+
+        Uses only this coil's own B-field (B_ext from other coils is
+        bypassed) over a bounding box sized ``margin × coil extent``.
+        Returns L in henries, or None if it can't be evaluated.
+
+        Parameters
+        ----------
+        grid : int
+            Cubical sampling density (grid³ points total). 20 → 8 k pts
+            (≈ 2–5 s per coil) balances speed vs. accuracy for
+            engineering estimates.
+        margin : float
+            Box half-extent as a multiple of the coil's own bounding box
+            half-width. 2.0 gives a sampling volume 4× wider than the
+            coil in each axis — usually enough for |B|² to decay.
+        core_radius : float
+            Near-segment regularization distance (metres) used to
+            prevent the Biot-Savart divergence for grid points that
+            fall adjacent to the filaments.
+        progress_callback : callable or None
+            Called with an integer percentage (0..100) while the grid
+            is being swept.
+        """
+        if self.current == 0 or self.coords is None:
+            return None
+        mu0 = 4.0 * np.pi * 1e-7
+
+        bb_min = self.coords.min(axis=0)
+        bb_max = self.coords.max(axis=0)
+        center = 0.5 * (bb_min + bb_max)
+        half_extent = 0.5 * (bb_max - bb_min) * margin
+        # For near-planar coils give the short axis real depth so the box
+        # isn't degenerate; fall back to a scale set by the long axes.
+        min_half = 0.5 * float(np.linalg.norm(half_extent))
+        half_extent = np.maximum(half_extent, min_half)
+
+        xs = np.linspace(center[0] - half_extent[0],
+                         center[0] + half_extent[0], grid)
+        ys = np.linspace(center[1] - half_extent[1],
+                         center[1] + half_extent[1], grid)
+        zs = np.linspace(center[2] - half_extent[2],
+                         center[2] + half_extent[2], grid)
+        dV = ((xs[1] - xs[0]) * (ys[1] - ys[0]) * (zs[1] - zs[0]))
+
+        X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+        pts_all = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+
+        # Smaller chunks keep peak memory bounded; big chunks spike VRAM
+        # when the (M, n_seg, 3) temp in _bfield_from_source gets large.
+        chunk = 500
+        n_total = len(pts_all)
+        n_chunks = (n_total + chunk - 1) // chunk
+        sum_B2 = 0.0
+        use_vol = self._n_fil > 1
+        for i, start in enumerate(range(0, n_total, chunk)):
+            end = min(start + chunk, n_total)
+            if use_vol:
+                B = self._bfield_vec_volumetric(
+                    pts_all[start:end], core_radius=core_radius,
+                )
+            else:
+                B = self._bfield_vec(
+                    pts_all[start:end], core_radius=core_radius,
+                )
+            # Drop non-finite contributions (near-segment regularization
+            # can still yield NaN/Inf for singular geometries — e.g. a
+            # grid point landing exactly on a midpoint).
+            B = np.where(np.isfinite(B), B, 0.0)
+            sum_B2 += float(np.sum(B * B))
+            if progress_callback is not None and (i % 4 == 0 or end == n_total):
+                progress_callback(int(100 * end / n_total))
+
+        if not np.isfinite(sum_B2) or sum_B2 <= 0.0:
+            return None
+        W = sum_B2 * dV / (2.0 * mu0)          # magnetic energy in the box
+        L = 2.0 * W / (self.current * self.current)
+        return float(L)
 
     # ------------------------------------------------------------------
     # Field harmonics (cylindrical multipole decomposition)
