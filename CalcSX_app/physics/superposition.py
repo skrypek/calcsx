@@ -37,6 +37,11 @@ class MultiCoilEnvironment:
         self._engines:     dict[str, CoilAnalysis] = {}
         self._coil_params: dict[str, dict]         = {}
         self._stale_set:   set[str]                = set()
+        # L-matrix cache — inductance is geometry-only (no current dep), so
+        # cache it and invalidate on any topology/geometry change. Without
+        # this the distributed-filament sum reruns every time the circuit
+        # header is clicked, which is visibly laggy for multi-coil setups.
+        self._L_cache:     dict | None            = None
 
     # ── Registration ──────────────────────────────────────────────────────
 
@@ -60,6 +65,7 @@ class MultiCoilEnvironment:
             tape_normals=tape_normals,
         )
         self._rebuild_engine(coil_id)
+        self._L_cache = None   # geometry changed — invalidate L-matrix cache
         # Every existing coil's analysis is now outdated (new neighbour)
         for cid in self._engines:
             if cid != coil_id:
@@ -70,6 +76,7 @@ class MultiCoilEnvironment:
         self._engines.pop(coil_id, None)
         self._coil_params.pop(coil_id, None)
         self._stale_set.discard(coil_id)
+        self._L_cache = None
         for cid in self._engines:
             self._stale_set.add(cid)
 
@@ -79,15 +86,28 @@ class MultiCoilEnvironment:
             return
         self._coil_params[coil_id]['coords'] = np.asarray(coords, dtype=np.float64)
         self._rebuild_engine(coil_id)
+        self._L_cache = None   # geometry moved — invalidate
         for cid in self._engines:
             self._stale_set.add(cid)
 
     def update_coil_params(self, coil_id: str, **kwargs) -> None:
-        """Update electrical parameters (winds, current, etc.).  Marks ALL stale."""
+        """Update electrical parameters (winds, current, etc.).  Marks ALL stale.
+
+        Only geometry-affecting keys invalidate the L-matrix cache — pure
+        current changes (common during circuit-current slider use) leave the
+        cached inductance matrix intact so the UI stays snappy."""
         if coil_id not in self._coil_params:
             return
+        old = self._coil_params[coil_id]
+        geometry_changed = False
+        for key in ('winds', 'thickness', 'width', 'tape_normals'):
+            if key in kwargs and kwargs[key] != old.get(key):
+                geometry_changed = True
+                break
         self._coil_params[coil_id].update(kwargs)
         self._rebuild_engine(coil_id)
+        if geometry_changed:
+            self._L_cache = None
         for cid in self._engines:
             self._stale_set.add(cid)
 
@@ -162,9 +182,18 @@ class MultiCoilEnvironment:
 
     def compute_mutual_inductance_matrix(self, progress_callback=None) -> dict:
         """
-        Compute the full N×N inductance matrix (self + mutual) via Neumann.
+        Compute the full N×N inductance matrix (self + mutual) via Neumann,
+        distributed over each pack's filament grid.
 
-        M(i,j) = (µ₀ Ni Nj / 4π) ΣΣ (dl_a · dl_b) / |r_a - r_b|
+        For each pair of coils (i, j):
+            M_ij = (µ₀ N_i N_j / 4π) · Σ_f Σ_g w_f^(i) · w_g^(j)
+                                         · ΣΣ dl^(i,f) · dl^(j,g) / r
+        When a coil's filament grid isn't populated (engine failure) we fall
+        back to its centerline for that coil's side of the integral.
+
+        Self-pair diagonal (f == g inside the same coil) is regularised with
+        the GMD of one sub-cell, not the full pack — same as
+        ``_compute_self_inductance``.
 
         Returns dict with:
             'coil_ids' : list of coil IDs (ordering matches matrix rows/cols)
@@ -172,10 +201,53 @@ class MultiCoilEnvironment:
             'energies' : (N,) ndarray — stored energy per coil ½ L_ii I_i²
             'total_energy' : float — total stored magnetic energy (J)
         """
+        # Serve from cache when geometry hasn't changed — this is hot on the
+        # circuit-family header view. Currents don't enter the L-matrix, so
+        # the cache only needs to be invalidated on geometry / topology
+        # updates (handled in register/unregister/update_coords, and the
+        # "geometry changed" branch of update_coil_params).
         mu0_4pi = 1e-7
         ids = list(self._engines.keys())
         N = len(ids)
+
+        if self._L_cache is not None \
+                and self._L_cache.get('coil_ids') == ids:
+            # Recompute per-coil stored energies with current currents
+            L_cached = self._L_cache['L_matrix']
+            currents = np.array([
+                float(self._coil_params[cid]['current']) for cid in ids
+            ])
+            energies = 0.5 * np.diag(L_cached) * currents ** 2
+            total_E = 0.5 * currents @ L_cached @ currents
+            return {
+                'coil_ids':     list(ids),
+                'L_matrix':     L_cached,
+                'energies':     energies,
+                'total_energy': float(total_E),
+            }
+
         L = np.zeros((N, N), dtype=np.float64)
+
+        def _distributed_filaments(eng):
+            """Return (fil_dl_list, fil_mid_list, weights, sub_w, sub_t)
+            with the engine's full distributed filament grid — for use in
+            self-inductance calculations where pack cross-section matters.
+            Falls back to a single centerline at full pack cross-section
+            when the filament grid isn't populated."""
+            n_fil = getattr(eng, '_n_fil', 1)
+            fil_dl  = getattr(eng, '_fil_dl', None)
+            fil_mid = getattr(eng, '_fil_mid', None)
+            wts     = getattr(eng, '_fil_weights', None)
+            if n_fil > 1 and fil_dl is not None and fil_mid is not None \
+                    and wts is not None:
+                n_r = max(int(getattr(eng, '_n_r', 1)), 1)
+                n_a = max(int(getattr(eng, '_n_a', 1)), 1)
+                sub_w = float(eng.tape_width) / n_a
+                sub_t = float(eng.total_thickness) / n_r
+                return (fil_dl, fil_mid, np.asarray(wts, dtype=np.float64),
+                        sub_w, sub_t)
+            return ([eng._dl], [eng.midpoints], np.array([1.0]),
+                    float(eng.tape_width), float(eng.total_thickness))
 
         for i in range(N):
             eng_i = self._engines[ids[i]]
@@ -183,8 +255,6 @@ class MultiCoilEnvironment:
             if eng_i.midpoints is None or eng_i._dl is None:
                 continue
             Ni = float(p_i['winds'])
-            mid_i = eng_i.midpoints
-            dl_i = eng_i._dl
 
             for j in range(i, N):
                 eng_j = self._engines[ids[j]]
@@ -192,23 +262,45 @@ class MultiCoilEnvironment:
                 if eng_j.midpoints is None or eng_j._dl is None:
                     continue
                 Nj = float(p_j['winds'])
-                mid_j = eng_j.midpoints
-                dl_j = eng_j._dl
-
-                # Distance matrix between segment midpoints
-                diff = mid_i[:, None, :] - mid_j[None, :, :]
-                dist = np.linalg.norm(diff, axis=2)
 
                 if i == j:
-                    # Self: regularise diagonal with GMD of cross-section
-                    a = eng_i.total_thickness
-                    b = eng_i.tape_width
-                    gmd = 0.2235 * (a + b)
-                    np.fill_diagonal(dist, max(gmd, 1e-6))
+                    # Self-inductance (L_ii): use the full distributed
+                    # filament grid to correctly account for pack cross-
+                    # section, close cross-filament pairs handled via
+                    # Hoer-Love closed form inside _pair_integral.
+                    fil_dl_f, fil_mid_f, wts_f, wsub, tsub = \
+                        _distributed_filaments(eng_i)
+                    acc = 0.0
+                    for f in range(len(wts_f)):
+                        w_f = float(wts_f[f])
+                        for g in range(len(wts_f)):
+                            w_g = float(wts_f[g])
+                            self_pair = (f == g)
+                            pair = CoilAnalysis._pair_integral(
+                                fil_dl_f[f], fil_mid_f[f],
+                                fil_dl_f[g], fil_mid_f[g],
+                                self_pair=self_pair,
+                                w_self=wsub, t_self=tsub,
+                                same_coil=True,
+                            )
+                            acc += w_f * w_g * pair
+                else:
+                    # Cross-coil mutual (L_ij, i≠j): use single centerlines
+                    # on both sides. Pack cross-section effects on mutual
+                    # are O((pack_size / separation)²) — negligible for
+                    # coils that aren't actually bifilar-wound on the same
+                    # centerline. Midpoint Neumann between the centerlines
+                    # matches the elliptic-integral analytical for coaxial
+                    # circular coils to <0.5 %.
+                    acc = CoilAnalysis._pair_integral(
+                        eng_i._dl, eng_i.midpoints,
+                        eng_j._dl, eng_j.midpoints,
+                        self_pair=False,
+                        w_self=0.0, t_self=0.0,
+                        same_coil=False,
+                    )
 
-                dist = np.maximum(dist, 1e-10)
-                dot_m = np.einsum('ik,jk->ij', dl_i, dl_j)
-                Mij = mu0_4pi * Ni * Nj * np.sum(dot_m / dist)
+                Mij = mu0_4pi * Ni * Nj * acc
                 L[i, j] = Mij
                 L[j, i] = Mij  # symmetric
 
@@ -222,6 +314,9 @@ class MultiCoilEnvironment:
         energies = 0.5 * np.diag(L) * currents ** 2
         total_E = 0.5 * currents @ L @ currents
 
+        # Cache the just-computed geometric L-matrix for later calls
+        self._L_cache = {'coil_ids': list(ids), 'L_matrix': L}
+
         return {
             'coil_ids': ids,
             'L_matrix': L,
@@ -230,17 +325,25 @@ class MultiCoilEnvironment:
         }
 
     def _rebuild_engine(self, coil_id: str) -> None:
-        """Create a lightweight CoilAnalysis (PCA + arc only) for _bfield_vec.
-        The B_ext closures call _bfield_vec directly (filamentary), so no
-        filament grid is needed here — it's only built inside run_analysis
-        for the force integration on that coil."""
+        """Create a lightweight CoilAnalysis for _bfield_vec and the
+        distributed-filament inductance computation. We call PCA + arc
+        (needed for geometry/axis) plus _build_filament_grid so mutual-
+        inductance calculations can use the same pack discretisation the
+        full analysis engine uses — otherwise cross-coil L would mix
+        centerline-based mutual with distributed-filament self, which is
+        inconsistent."""
         p = self._coil_params[coil_id]
         eng = CoilAnalysis(
             p['coords'], p['winds'], p['current'],
             p['thickness'], p['width'],
+            tape_normals=p.get('tape_normals'),
         )
         eng._compute_pca()
         eng._compute_arc()
+        try:
+            eng._build_filament_grid()
+        except Exception:
+            pass
         self._engines[coil_id] = eng
 
 

@@ -45,6 +45,8 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QTreeWidget,
     QTreeWidgetItem,
+    QAbstractItemView,
+    QMenu,
     QCheckBox,
     QComboBox,
     QListWidget,
@@ -166,6 +168,24 @@ class GlobalFieldLinesWorker(QObject):
         self.finished.emit((lines, B_mags))
 
 
+class LMatrixWorker(QObject):
+    """Warm ``MultiCoilEnvironment._L_cache`` off the UI thread so the first
+    circuit-header click doesn't freeze the app on the N×N Neumann double sum."""
+    finished = pyqtSignal(object)   # coil_ids list used, or None on failure
+
+    def __init__(self, multi_env):
+        super().__init__()
+        self._env = multi_env
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            result = self._env.compute_mutual_inductance_matrix()
+            self.finished.emit(result.get('coil_ids'))
+        except Exception:
+            self.finished.emit(None)
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,6 +300,146 @@ class _RibbonBtn(QFrame):
             self._set_bg(THEME['hi_blue'] if self._checked else "transparent")
 
 
+class _DropdownRibbonBtn(QWidget):
+    """Fusion360-style split button: icon+label button on top showing the
+    current default action, with a small chevron strip at the bottom that
+    pops up a menu of all available actions. Clicking an action in the menu
+    sets it as the new default AND fires it immediately.
+
+    Each action has its own enable/disable state via ``set_action_enabled``.
+    The primary button follows the enabled state of the currently-selected
+    default; disabled actions in the dropdown appear greyed out.
+
+    Constructor takes a list of ``(symbol, label, callback)`` tuples; the
+    first entry is the initial default. All entries (including the default)
+    appear in the dropdown.
+    """
+    def __init__(self, actions: list, parent=None):
+        super().__init__(parent)
+        self._actions = list(actions)                 # [(sym, label, cb), ...]
+        self._enabled_flags = [True] * len(self._actions)
+        self._default_idx = 0
+
+        sym, lbl, _ = self._actions[0]
+        self._main_btn = _RibbonBtn(sym, lbl, enabled=True)
+        self._main_btn.clicked.connect(self._fire_default)
+
+        self._chev_btn = QPushButton("▾")
+        self._chev_btn.setFixedHeight(10)
+        self._chev_btn.setFlat(True)
+        self._chev_btn.setCursor(Qt.PointingHandCursor)
+        # Use an objectName-scoped selector so the app-wide QPushButton QSS
+        # (which sets a 1px border + padding on every button) doesn't leak
+        # through. Without this override there's a visible horizontal line
+        # where the chevron's top/bottom border meets the main button below
+        # the label — readable as a "middle bar" across each dropdown tile.
+        self._chev_btn.setObjectName('ribbon_chevron')
+        self._chev_btn.setStyleSheet(
+            "QPushButton#ribbon_chevron {"
+            f" color: {THEME['text_dim']}; font-size: 8pt;"
+            " border: 0px; border-width: 0; outline: 0;"
+            " background: transparent; padding: 0; margin: 0;"
+            " }"
+            "QPushButton#ribbon_chevron:hover {"
+            f" color: {THEME['text']};"
+            f" background: {THEME['input']};"
+            " border: 0px; }"
+        )
+        self._chev_btn.clicked.connect(self._show_menu)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self._main_btn)
+        lay.addWidget(self._chev_btn)
+
+        self.setFixedWidth(self._main_btn.width())
+
+    def _fire_default(self) -> None:
+        if not self._enabled_flags[self._default_idx]:
+            return
+        try:
+            self._actions[self._default_idx][2]()
+        except Exception:
+            pass
+
+    def _show_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background:{THEME['panel']};"
+            f" color:{THEME['text']}; border:1px solid {THEME['border']}; }}"
+            f"QMenu::item {{ padding:6px 14px; }}"
+            f"QMenu::item:disabled {{ color:{THEME['text_dim']}; }}"
+            f"QMenu::item:selected {{ background:{THEME['hi_blue']};"
+            f" color:{THEME['text']}; }}"
+        )
+        for i, (sym, label, _) in enumerate(self._actions):
+            text = f"{sym}   {label.replace(chr(10), ' ')}"
+            act = menu.addAction(text)
+            act.setData(i)
+            act.setEnabled(self._enabled_flags[i])
+        chosen = menu.exec_(self._chev_btn.mapToGlobal(
+            self._chev_btn.rect().bottomLeft()))
+        if chosen is not None:
+            idx = chosen.data()
+            if isinstance(idx, int) and 0 <= idx < len(self._actions) \
+                    and self._enabled_flags[idx]:
+                self._set_default(idx)
+                self._fire_default()
+
+    def _set_default(self, idx: int) -> None:
+        self._default_idx = idx
+        sym, lbl, _ = self._actions[idx]
+        self._main_btn._sym_lbl.setText(sym)
+        self._main_btn._txt_lbl.setText(lbl)
+        self._main_btn.set_action_enabled(self._enabled_flags[idx])
+
+    def set_action_enabled(self, idx: int, enabled: bool) -> None:
+        """Enable / disable a specific action by its index."""
+        if 0 <= idx < len(self._enabled_flags):
+            self._enabled_flags[idx] = bool(enabled)
+            if idx == self._default_idx:
+                self._main_btn.set_action_enabled(bool(enabled))
+
+    def action_proxy(self, idx: int):
+        """Return a lightweight proxy with ``set_action_enabled(bool)``
+        targeting this dropdown's index-`idx` action — lets call-sites
+        treat a specific dropdown action like the old standalone button
+        (e.g. `_btn_reanalyze.set_action_enabled(True)`)."""
+        parent = self
+        class _Proxy:
+            def set_action_enabled(self, on: bool) -> None:
+                parent.set_action_enabled(idx, on)
+            # Kept for legacy callers that checked state
+            def isChecked(self) -> bool:
+                return False
+            def setChecked(self, _on: bool) -> None:
+                pass
+            def refresh_theme(self) -> None:
+                parent._main_btn.refresh_theme()
+        return _Proxy()
+
+    def refresh_theme(self) -> None:
+        self._main_btn.refresh_theme()
+        # Use an objectName-scoped selector so the app-wide QPushButton QSS
+        # (which sets a 1px border + padding on every button) doesn't leak
+        # through. Without this override there's a visible horizontal line
+        # where the chevron's top/bottom border meets the main button below
+        # the label — readable as a "middle bar" across each dropdown tile.
+        self._chev_btn.setObjectName('ribbon_chevron')
+        self._chev_btn.setStyleSheet(
+            "QPushButton#ribbon_chevron {"
+            f" color: {THEME['text_dim']}; font-size: 8pt;"
+            " border: 0px; border-width: 0; outline: 0;"
+            " background: transparent; padding: 0; margin: 0;"
+            " }"
+            "QPushButton#ribbon_chevron:hover {"
+            f" color: {THEME['text']};"
+            f" background: {THEME['input']};"
+            " border: 0px; }"
+        )
+
+
 def _vbar() -> QFrame:
     """Thin vertical separator between ribbon groups."""
     f = QFrame()
@@ -290,7 +450,10 @@ def _vbar() -> QFrame:
 
 
 def _ribbon_group(label: str, buttons: list) -> QWidget:
-    """Labeled group of ribbon buttons separated by a group label below."""
+    """Group of ribbon buttons. The ``label`` argument is accepted for
+    API compatibility but no longer rendered — per-button labels plus the
+    chevron strip on dropdown buttons convey grouping visually without
+    the extra row of small-caps text below."""
     w   = QWidget()
     out = QVBoxLayout(w)
     out.setContentsMargins(4, 4, 4, 0)
@@ -302,12 +465,7 @@ def _ribbon_group(label: str, buttons: list) -> QWidget:
     for b in buttons:
         row.addWidget(b)
 
-    glbl = QLabel(label)
-    glbl.setAlignment(Qt.AlignCenter)
-    glbl.setObjectName('ribbon_grp_lbl')
-
     out.addLayout(row, stretch=1)
-    out.addWidget(glbl)
     return w
 
 
@@ -334,13 +492,25 @@ class RibbonBar(QWidget):
     load_session             = pyqtSignal()
     # Inspect — probe
     add_hall_probe           = pyqtSignal()
+    # Circuits — group/ungroup selected coils into a wired circuit
+    group_as_series          = pyqtSignal()
+    group_as_parallel        = pyqtSignal()
+    ungroup_selection        = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(88)
+        # Scope every stylesheet to the widget's own object name so
+        # `border-bottom` doesn't cascade to descendants. Without the
+        # scoping, Qt applies the bottom border to every child widget,
+        # which renders a stacked 1-px line under each ribbon button
+        # (the artifact that was crossing every tile).
+        self.setObjectName('ribbon_bar_widget')
         self.setStyleSheet(
-            f"background:{THEME['panel']}; "
-            f"border-bottom:1px solid {THEME['border']};"
+            f"#ribbon_bar_widget {{"
+            f"  background:{THEME['panel']};"
+            f"  border-bottom:1px solid {THEME['border']};"
+            f"}}"
         )
 
         root = QVBoxLayout(self)
@@ -350,8 +520,12 @@ class RibbonBar(QWidget):
         # ── Tab strip ─────────────────────────────────────────────────────────
         self._tab_bar = QWidget()
         self._tab_bar.setFixedHeight(24)
+        self._tab_bar.setObjectName('ribbon_tab_bar')
         self._tab_bar.setStyleSheet(
-            f"background:{THEME['bg']}; border-bottom:1px solid {THEME['border']};"
+            f"#ribbon_tab_bar {{"
+            f"  background:{THEME['bg']};"
+            f"  border-bottom:1px solid {THEME['border']};"
+            f"}}"
         )
         tb_lay = QHBoxLayout(self._tab_bar)
         tb_lay.setContentsMargins(8, 0, 0, 0)
@@ -383,21 +557,37 @@ class RibbonBar(QWidget):
         ta_lay.setContentsMargins(4, 0, 4, 0)
         ta_lay.setSpacing(0)
 
-        # Build tool buttons (each is its own object — no shared widget refs)
-        self._btn_load       = _RibbonBtn("▲", "Load\nCoil")
-        self._btn_bobbin     = _RibbonBtn("⬡", "Import\nBobbin")
-        self._btn_run        = _RibbonBtn("▶", "Run\nAnalysis")
-        self._btn_reanalyze  = _RibbonBtn("⟳", "Re-analyze\nAll", enabled=False)
-        btn_help_sim         = _RibbonBtn("?", "Help")
+        # FILE dropdown — Load Coil (primary) / Import Bobbin / Load Environment
+        self._file_dropdown = _DropdownRibbonBtn([
+            ("▲", "Load\nCoil",        lambda: self.load_csv.emit()),
+            ("⬡", "Import\nBobbin",    lambda: self.import_bobbin.emit()),
+            ("⬆", "Load\nEnvironment", lambda: self.load_session.emit()),
+        ])
+        # ANALYSIS dropdown — Run Analysis (primary) / Re-analyze All.
+        # Re-analyze starts disabled; gets enabled when there are stale coils.
+        self._analysis_dropdown = _DropdownRibbonBtn([
+            ("▶", "Run\nAnalysis",     lambda: self.run_analysis.emit()),
+            ("⟳", "Re-analyze\nAll",   lambda: self.reanalyze_all.emit()),
+        ])
+        self._analysis_dropdown.set_action_enabled(1, False)
+
+        # Legacy handles: proxies targeting specific actions within each
+        # dropdown so existing ``_btn_run.set_action_enabled(bool)`` etc.
+        # calls keep working without changes at the call sites.
+        self._btn_load      = self._file_dropdown.action_proxy(0)
+        self._btn_bobbin    = self._file_dropdown.action_proxy(1)
+        self._btn_run       = self._analysis_dropdown.action_proxy(0)
+        self._btn_reanalyze = self._analysis_dropdown.action_proxy(1)
+        btn_help_sim        = _RibbonBtn("?", "Help")
 
         # SIMULATION groups
         self._sim_w = QWidget()
         sl = QHBoxLayout(self._sim_w)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(4)
-        sl.addWidget(_ribbon_group("FILE",     [self._btn_load, self._btn_bobbin]))
+        sl.addWidget(_ribbon_group("FILE",     [self._file_dropdown]))
         sl.addWidget(_vbar())
-        sl.addWidget(_ribbon_group("ANALYSIS", [self._btn_run, self._btn_reanalyze]))
+        sl.addWidget(_ribbon_group("ANALYSIS", [self._analysis_dropdown]))
         sl.addWidget(_vbar())
         sl.addWidget(_ribbon_group("HELP",     [btn_help_sim]))
         sl.addStretch(1)
@@ -444,6 +634,16 @@ class RibbonBar(QWidget):
         cl.addWidget(_ribbon_group("GENERATORS", [
             self._btn_generate,
         ]))
+        # Circuit wiring — group multi-selected coils into series / parallel
+        self._btn_series    = _RibbonBtn("⇌", "Group as\nSeries",   enabled=False)
+        self._btn_parallel  = _RibbonBtn("∥", "Group as\nParallel", enabled=False)
+        self._btn_ungroup   = _RibbonBtn("⊘", "Ungroup",            enabled=False)
+        cl.addWidget(_vbar())
+        cl.addWidget(_ribbon_group("CIRCUITS", [
+            self._btn_series,
+            self._btn_parallel,
+            self._btn_ungroup,
+        ]))
         cl.addStretch(1)
         self._construct_w.hide()
 
@@ -476,11 +676,9 @@ class RibbonBar(QWidget):
 
         root.addWidget(tool_area, stretch=1)
 
-        # Wire signals
-        self._btn_load.clicked.connect(self.load_csv)
-        self._btn_bobbin.clicked.connect(self.import_bobbin)
-        self._btn_run.clicked.connect(self.run_analysis)
-        self._btn_reanalyze.clicked.connect(self.reanalyze_all)
+        # Wire signals. File and Analysis buttons are now dropdown widgets
+        # that emit their own signals via lambdas (wired at construction),
+        # so no separate .clicked hookup needed here.
         self._btn_field_lines.clicked.connect(self.compute_field_lines)
         self._btn_cross_sec.clicked.connect(self.compute_cross_section)
         self._btn_global_field.toggled.connect(self.global_field_toggled)
@@ -491,6 +689,9 @@ class RibbonBar(QWidget):
         btn_help_sim.clicked.connect(self.show_help)
         self._btn_settings.clicked.connect(self.open_settings)
         self._btn_hall_probe.clicked.connect(self.add_hall_probe)
+        self._btn_series.clicked.connect(self.group_as_series)
+        self._btn_parallel.clicked.connect(self.group_as_parallel)
+        self._btn_ungroup.clicked.connect(self.ungroup_selection)
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -507,6 +708,14 @@ class RibbonBar(QWidget):
         self._btn_translate.set_action_enabled(on)
         self._btn_rotate.set_action_enabled(on)
         self._btn_reset_xfm.set_action_enabled(on)
+
+    def set_circuit_enabled(self, group_ok: bool, ungroup_ok: bool) -> None:
+        """Enable grouping buttons when ≥2 coils are multi-selected; enable
+        the ungroup button when the current selection contains any grouped
+        coils."""
+        self._btn_series.set_action_enabled(group_ok)
+        self._btn_parallel.set_action_enabled(group_ok)
+        self._btn_ungroup.set_action_enabled(ungroup_ok)
 
     def _on_translate_toggled(self, checked: bool) -> None:
         """Mutual exclusion: turning on Translate turns off Rotate."""
@@ -525,10 +734,16 @@ class RibbonBar(QWidget):
     def refresh_theme(self) -> None:
         """Re-apply all explicit styles after a theme switch."""
         self.setStyleSheet(
-            f"background:{THEME['panel']}; border-bottom:1px solid {THEME['border']};"
+            f"#ribbon_bar_widget {{"
+            f"  background:{THEME['panel']};"
+            f"  border-bottom:1px solid {THEME['border']};"
+            f"}}"
         )
         self._tab_bar.setStyleSheet(
-            f"background:{THEME['bg']}; border-bottom:1px solid {THEME['border']};"
+            f"#ribbon_tab_bar {{"
+            f"  background:{THEME['bg']};"
+            f"  border-bottom:1px solid {THEME['border']};"
+            f"}}"
         )
         self._app_lbl.setStyleSheet(
             f"color:{THEME['accent']}; font-size:8pt; font-weight:bold; "
@@ -540,6 +755,9 @@ class RibbonBar(QWidget):
         for tab_w in self._tab_widgets.values():
             for rb in tab_w.findChildren(_RibbonBtn):
                 rb.refresh_theme()
+            # Also re-style chevron strips on dropdown buttons
+            for db in tab_w.findChildren(_DropdownRibbonBtn):
+                db.refresh_theme()
 
     def _activate(self, name: str) -> None:
         if name == self._active_tab:
@@ -635,11 +853,13 @@ class BrowserPanel(QWidget):
     coil_visibility_toggled  = pyqtSignal(str, bool)
     coil_delete_requested    = pyqtSignal(str)
     coil_selected            = pyqtSignal(str)
+    coils_multi_selected     = pyqtSignal(list)             # [coil_id, ...] when >1 selected
     coil_renamed             = pyqtSignal(str, str)
     coil_recolored           = pyqtSignal(str, str)         # (coil_id, hex_color)
     probe_selected           = pyqtSignal(str)                # probe_id
     probe_delete_requested   = pyqtSignal(str)                # probe_id
     probe_recolored          = pyqtSignal(str, str)           # (probe_id, hex_color)
+    circuit_selected         = pyqtSignal(str)                # group_id
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -661,6 +881,8 @@ class BrowserPanel(QWidget):
         self._tree.setColumnCount(1)
         self._tree.setIndentation(14)
         self._tree.setAnimated(True)
+        # Allow Shift/⌘-click multi-selection for bulk coil edits + circuit grouping
+        self._tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._tree.setStyleSheet(f"""
             QTreeWidget {{
                 background:{THEME['panel']};
@@ -671,11 +893,15 @@ class BrowserPanel(QWidget):
                 height:22px;
                 padding:0;
             }}
-            QTreeWidget::item:selected {{
+            QTreeWidget::item:selected,
+            QTreeWidget::item:selected:active,
+            QTreeWidget::item:selected:!active {{
                 background:{THEME['hi_blue']};
+                color:{THEME['text']};
             }}
         """)
         self._tree.itemClicked.connect(self._on_item_clicked)
+        self._tree.itemSelectionChanged.connect(self._on_selection_changed)
         root.addWidget(self._tree, stretch=1)
 
         # Single "COILS" top-level group
@@ -728,6 +954,149 @@ class BrowserPanel(QWidget):
         # probe_id → {'tree_item', 'readout_items': {key: QLabel}}
         self._probe_data: dict = {}
 
+        # group_id → {'tree_item', 'name_label', 'kind_label', 'color'}
+        self._circuit_data: dict = {}
+
+    # ── Public: circuit (folder-like) headers ─────────────────────────────────
+
+    def add_circuit_header(self, group_id: str, name: str,
+                             kind: str, color: str,
+                             insert_above: list | None = None) -> None:
+        """Add a circuit-family header row under COILS. Implementation note:
+        Qt's ``setItemWidget`` bindings don't survive reparenting tree items
+        (takeChild → addChild crashes), so we don't actually nest grouped
+        coils under the header. Instead the header is a sibling of the
+        coils at the COILS-group level, and member coils are visually
+        grouped by a colored left border painted on their row widget.
+
+        ``insert_above`` is an optional list of member coil IDs; when
+        provided, the header is inserted at the index of the first-listed
+        member so it reads naturally above its coils in the tree."""
+        if group_id in self._circuit_data:
+            return
+        # Compute insertion index so the header lands ABOVE its first member
+        insert_idx = self._coils_group.childCount()  # default: end
+        if insert_above:
+            for mid in insert_above:
+                mcoil = self._coil_data.get(mid)
+                if mcoil:
+                    try:
+                        idx = self._coils_group.indexOfChild(mcoil['tree_item'])
+                        if idx >= 0 and idx < insert_idx:
+                            insert_idx = idx
+                    except Exception:
+                        pass
+        item = QTreeWidgetItem()
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self._coils_group.insertChild(insert_idx, item)
+
+        w = QWidget()
+        w.setObjectName('circuit_row')
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(4)
+
+        bar = QLabel()
+        bar.setFixedSize(4, 18)
+        bar.setStyleSheet(f"background:{color}; border-radius:1px;")
+        lay.addWidget(bar)
+
+        icon = QLabel("▾")
+        icon.setStyleSheet(
+            f"color:{THEME['text_dim']}; font-size:9pt; padding-left:1px;"
+        )
+        lay.addWidget(icon)
+
+        n_lbl = QLabel(name)
+        n_lbl.setStyleSheet(
+            f"color:{THEME['text']}; font-size:8pt; font-weight:600;"
+        )
+        lay.addWidget(n_lbl)
+
+        k_lbl = QLabel(f"· {kind.capitalize()}")
+        k_lbl.setStyleSheet(f"color:{THEME['text_dim']}; font-size:8pt;")
+        lay.addWidget(k_lbl, stretch=1)
+
+        self._tree.setItemWidget(item, 0, w)
+        item.setSizeHint(0, QSize(0, 22))
+        self._circuit_data[group_id] = {
+            'tree_item':  item,
+            'name_label': n_lbl,
+            'kind_label': k_lbl,
+            'color_bar':  bar,
+            'color':      color,
+            'members':    set(),   # coil_ids currently badged with this color
+        }
+
+    def remove_circuit_header(self, group_id: str) -> None:
+        """Dissolve a circuit: clear the left-border color badge from member
+        coil rows, then delete the header item."""
+        entry = self._circuit_data.pop(group_id, None)
+        if not entry:
+            return
+        for cid in entry.get('members', set()):
+            self._set_coil_group_badge(cid, None)
+        header = entry['tree_item']
+        idx = self._coils_group.indexOfChild(header)
+        if idx >= 0:
+            self._coils_group.takeChild(idx)
+
+    def move_coil_under_circuit(self, coil_id: str, group_id: str) -> None:
+        """Badge a coil row with the circuit's color to visually group it.
+        No tree reparenting — the coil stays as a direct child of the
+        COILS group (see ``add_circuit_header`` for the design rationale)."""
+        coil = self._coil_data.get(coil_id)
+        grp  = self._circuit_data.get(group_id)
+        if not coil or not grp:
+            return
+        # If the coil was in another circuit, drop it from there first
+        for gid, gdata in self._circuit_data.items():
+            if gid != group_id and coil_id in gdata.get('members', set()):
+                gdata['members'].discard(coil_id)
+        grp.setdefault('members', set()).add(coil_id)
+        self._set_coil_group_badge(coil_id, grp['color'])
+
+    def move_coil_to_root(self, coil_id: str) -> None:
+        """Strip the circuit badge from a coil row (coil leaves its circuit).
+        No tree reparenting — just a visual update."""
+        for gid, gdata in self._circuit_data.items():
+            gdata.get('members', set()).discard(coil_id)
+        self._set_coil_group_badge(coil_id, None)
+
+    def _set_coil_group_badge(self, coil_id: str, color: str | None) -> None:
+        """Apply / remove a colored left-border on a coil row widget to
+        indicate circuit-family membership. The selector is scoped to
+        ``#coil_row`` so the border only appears on the row frame, not on
+        every descendant widget (eye, swatch, labels, delete button)."""
+        coil = self._coil_data.get(coil_id)
+        if not coil:
+            return
+        w = coil.get('row_widget')
+        if w is None:
+            return
+        if color:
+            w.setStyleSheet(
+                f"QWidget#coil_row {{ border-left:3px solid {color}; }}"
+            )
+        else:
+            w.setStyleSheet("")
+
+    def update_circuit_header(self, group_id: str, name: str | None = None,
+                               kind: str | None = None,
+                               color: str | None = None) -> None:
+        entry = self._circuit_data.get(group_id)
+        if not entry:
+            return
+        if name is not None:
+            entry['name_label'].setText(name)
+        if kind is not None:
+            entry['kind_label'].setText(f"· {kind.capitalize()}")
+        if color is not None:
+            entry['color'] = color
+            entry['color_bar'].setStyleSheet(
+                f"background:{color}; border-radius:1px;"
+            )
+
     # ── Public: coil items ────────────────────────────────────────────────────
 
     def add_coil_item(self, coil_id: str, display_name: str, color: str) -> None:
@@ -738,6 +1107,7 @@ class BrowserPanel(QWidget):
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
 
         w = QWidget()
+        w.setObjectName('coil_row')   # scope stylesheet to this widget only
         lay = QHBoxLayout(w)
         lay.setContentsMargins(2, 0, 2, 0)
         lay.setSpacing(3)
@@ -772,10 +1142,12 @@ class BrowserPanel(QWidget):
         item.setSizeHint(0, QSize(0, 22))
         self._coil_data[coil_id] = {
             'tree_item':  item,
+            'row_widget': w,          # kept so we can re-attach after reparenting
             'name_label': n_lbl,
             'swatch':     swatch,
             'color':      color,
-            'analysis':   {},
+            'analysis':   {},         # layer_name → (child_item, eye)
+            'analysis_widgets': {},   # layer_name → row_widget (for re-attach)
         }
         self._coils_group.setExpanded(True)
         item.setExpanded(True)
@@ -840,6 +1212,7 @@ class BrowserPanel(QWidget):
         self._tree.setItemWidget(child, 0, w)
         child.setSizeHint(0, QSize(0, 22))
         entry['analysis'][layer_name] = (child, eye)
+        entry.setdefault('analysis_widgets', {})[layer_name] = w
         coil_item.setExpanded(True)
 
         if not visible:
@@ -964,6 +1337,7 @@ class BrowserPanel(QWidget):
 
         lbl = QLabel(display_name)
         lbl.setStyleSheet(f"color:{THEME['text']}; font-size:8pt;")
+        lbl.setToolTip(display_name)
         lay.addWidget(lbl, stretch=1)
 
         del_btn = QPushButton("×")
@@ -1007,7 +1381,28 @@ class BrowserPanel(QWidget):
             'readout_items': readout_items,
             'swatch': sw,
             'color': color,
+            'name_label': lbl,
+            'base_name': display_name,
         }
+
+    def update_probe_parent_label(self, probe_id: str,
+                                   coil_ref: str | None,
+                                   mode: str) -> None:
+        """Update the probe's browser label to show its parent coil and mode,
+        so a reparent is obvious at a glance (e.g. 'Probe 1 → coil_1 · PCA')."""
+        entry = self._probe_data.get(probe_id)
+        if entry is None:
+            return
+        base = entry.get('base_name', 'Probe')
+        lbl = entry.get('name_label')
+        if lbl is None:
+            return
+        if coil_ref:
+            text = f"{base} → {coil_ref} · {mode.upper()}"
+        else:
+            text = base
+        lbl.setText(text)
+        lbl.setToolTip(text)
 
     def update_probe_readout(self, probe_id: str, Bx: float, By: float, Bz: float,
                              B_mag: float, px: float, py: float, pz: float) -> None:
@@ -1047,6 +1442,11 @@ class BrowserPanel(QWidget):
     # ── Private ──────────────────────────────────────────────────────────────
 
     def _on_item_clicked(self, item, _col) -> None:
+        # Circuit folder header
+        for gid, gdata in self._circuit_data.items():
+            if gdata['tree_item'] is item:
+                self.circuit_selected.emit(gid)
+                return
         # Check if a probe was clicked
         for pid, pdata in self._probe_data.items():
             if pdata['tree_item'] is item:
@@ -1061,6 +1461,47 @@ class BrowserPanel(QWidget):
                 if child_item is item:
                     self.coil_selected.emit(cid)
                     return
+
+    def _on_selection_changed(self) -> None:
+        """Authoritative view of the current multi-selection. Emits
+        ``coils_multi_selected`` with the list of selected coil IDs whenever
+        the set of selected rows changes — including the single-item and
+        empty cases (MainWindow uses this to clear multi-edit state only
+        when the selection truly collapses, not on every coil click, so a
+        shift-built selection survives navigation elsewhere).
+
+        Selecting a circuit folder header counts as selecting all of its
+        member coils, so a user can group/regroup or bulk-edit whole
+        circuits at once."""
+        selected = self._tree.selectedItems()
+        coil_ids: list[str] = []
+        seen: set = set()
+        for item in selected:
+            # Direct coil row
+            for cid, data in self._coil_data.items():
+                if data['tree_item'] is item:
+                    if not cid.startswith('bobbin_') and cid not in seen:
+                        coil_ids.append(cid); seen.add(cid)
+                    break
+            # Circuit header → expand to its tracked member coils
+            for gid, gdata in self._circuit_data.items():
+                if gdata['tree_item'] is item:
+                    for cid2 in gdata.get('members', set()):
+                        if cid2 not in seen and cid2 in self._coil_data:
+                            coil_ids.append(cid2); seen.add(cid2)
+                    break
+        self.coils_multi_selected.emit(coil_ids)
+
+    def selected_coil_ids(self) -> list:
+        """Return the list of currently selected coil IDs (excluding bobbins).
+        Ordered as in selection; single-selection returns a 1-list."""
+        out: list = []
+        for item in self._tree.selectedItems():
+            for cid, data in self._coil_data.items():
+                if data['tree_item'] is item and not cid.startswith('bobbin_'):
+                    out.append(cid)
+                    break
+        return out
 
     def _rename_coil(self, coil_id: str) -> None:
         if coil_id not in self._coil_data:
@@ -1167,6 +1608,27 @@ class PropertiesPanel(QScrollArea):
         coil_lay.setContentsMargins(0, 0, 0, 0)
         coil_lay.setSpacing(4)
 
+        # Multi-edit banner — shown when >1 coil is selected in the browser
+        self._multi_banner = QLabel()
+        self._multi_banner.setStyleSheet(
+            f"background:{THEME.get('hi_blue', '#3b5a8a')}; "
+            f"color:{THEME['text']}; font-size:8pt; font-weight:600; "
+            f"padding:3px 6px; border-radius:2px;"
+        )
+        self._multi_banner.setAlignment(Qt.AlignCenter)
+        self._multi_banner.hide()
+        coil_lay.addWidget(self._multi_banner)
+
+        # Circuit banner — shown when the active coil is part of a wired circuit
+        self._circuit_banner = QLabel()
+        self._circuit_banner.setStyleSheet(
+            f"color:{THEME['text']}; font-size:8pt; font-weight:600; "
+            f"padding:2px 4px; border-left:3px solid "
+            f"{THEME.get('accent', '#e06a2a')};"
+        )
+        self._circuit_banner.hide()
+        coil_lay.addWidget(self._circuit_banner)
+
         # Coil parameter form
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
@@ -1194,6 +1656,20 @@ class PropertiesPanel(QScrollArea):
         form.addRow("Tape Width (mm):", self.dspin_width)
         form.addRow("Axis Samples:",    self.spin_axis_pts)
         coil_lay.addLayout(form)
+        # Keep a reference to the "Current (A):" label so we can hide the
+        # whole row (label + spinbox) when the coil is driven by a circuit.
+        self._current_form_label = form.labelForField(self.dspin_current)
+
+        # Inherited-current note (shown INSTEAD of the Current row when the
+        # coil belongs to a circuit family — current is owned by the circuit)
+        self._inherited_current_lbl = QLabel()
+        self._inherited_current_lbl.setStyleSheet(
+            f"color:{THEME['text_dim']}; font-size:8pt; "
+            f"padding:2px 4px; font-style:italic;"
+        )
+        self._inherited_current_lbl.setWordWrap(True)
+        self._inherited_current_lbl.hide()
+        coil_lay.addWidget(self._inherited_current_lbl)
 
         # INSPECT — field line seeds
         coil_lay.addWidget(_hdivider())
@@ -1231,6 +1707,11 @@ class PropertiesPanel(QScrollArea):
         lay.addWidget(self._probe_w)
         self._probe_w.hide()
 
+        # ── Circuit controls (shown only when a circuit header is selected) ──
+        self._build_circuit_controls()
+        lay.addWidget(self._circuit_w)
+        self._circuit_w.hide()
+
         lay.addWidget(_hdivider())
 
         # Results summary (shown after analysis)
@@ -1244,9 +1725,11 @@ class PropertiesPanel(QScrollArea):
         sl.addWidget(self._results_hdr)
         self._sum_lbls:  dict = {}   # key → value QLabel
         self._sum_keys:  list = []   # key QLabels (for theme refresh)
+        self._sum_rows:  dict = {}   # key → row QWidget (for show/hide)
         for key in ("B cent.", "B axial", "Peak |B|", "Peak F", "Peak σ", "Arc len.",
-                    "Induct.", "Induct.(vol)", "Energy"):
-            row = QHBoxLayout()
+                    "Induct.", "Circuit L", "Energy"):
+            row_w = QWidget()
+            row = QHBoxLayout(row_w)
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(6)
             kl = QLabel(key + ":")
@@ -1259,9 +1742,10 @@ class PropertiesPanel(QScrollArea):
             )
             self._sum_lbls[key] = vl
             self._sum_keys.append(kl)
+            self._sum_rows[key] = row_w
             row.addWidget(kl)
             row.addWidget(vl, stretch=1)
-            sl.addLayout(row)
+            sl.addWidget(row_w)
 
         lay.addWidget(self._sum_w)
 
@@ -1392,18 +1876,204 @@ class PropertiesPanel(QScrollArea):
             self._probe_pca_radio.setChecked(pca_on)
             self._probe_xyz_w.setVisible(not pca_on)
             self._probe_pca_w.setVisible(pca_on)
-            self._probe_coil_lbl.setText(
-                f"Coil: {coil_ref}" if coil_ref else "Coil: — (select a coil first)"
-            )
+            if coil_ref:
+                mode_tag = "PCA" if pca_on else "XYZ"
+                self._probe_coil_lbl.setText(
+                    f"Parent: {coil_ref}  •  {mode_tag}"
+                )
+            else:
+                self._probe_coil_lbl.setText("Parent: — (select a coil first)")
             self._probe_pca_radio.setEnabled(coil_ref is not None)
         finally:
             for s in controls:
                 s.blockSignals(False)
 
+    # ── Circuit controls ──────────────────────────────────────────────────
+
+    circuit_current_changed  = pyqtSignal(str, float)   # (group_id, amps)
+    circuit_renamed          = pyqtSignal(str, str)     # (group_id, new_name)
+
+    def _build_circuit_controls(self) -> None:
+        self._circuit_w = QWidget()
+        cv = QVBoxLayout(self._circuit_w)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(4)
+
+        self._circuit_hdr = _section_lbl("CIRCUIT")
+        cv.addWidget(self._circuit_hdr)
+
+        self._cv_name_lbl = QLabel("—")
+        self._cv_name_lbl.setStyleSheet(
+            f"color:{THEME['text']}; font-size:10pt; font-weight:600; "
+            f"padding:2px 0;"
+        )
+        cv.addWidget(self._cv_name_lbl)
+
+        self._cv_kind_lbl = QLabel("")
+        self._cv_kind_lbl.setStyleSheet(
+            f"color:{THEME['text_dim']}; font-size:8pt;"
+        )
+        cv.addWidget(self._cv_kind_lbl)
+
+        cf = QFormLayout()
+        cf.setLabelAlignment(Qt.AlignRight)
+        cf.setSpacing(4)
+        cf.setContentsMargins(0, 4, 0, 0)
+        self._cv_dspin_current = QDoubleSpinBox()
+        self._cv_dspin_current.setRange(0, 1e6)
+        self._cv_dspin_current.setDecimals(1)
+        self._cv_dspin_current.setValue(0.0)
+        self._cv_dspin_current.valueChanged.connect(self._emit_cv_current)
+        cf.addRow("Current (A):", self._cv_dspin_current)
+        cv.addLayout(cf)
+
+        cv.addWidget(_hdivider())
+        self._cv_members_hdr = _section_lbl("MEMBERS")
+        cv.addWidget(self._cv_members_hdr)
+        self._cv_members_lbl = QLabel("")
+        self._cv_members_lbl.setStyleSheet(
+            f"color:{THEME['text']}; font-size:8pt; padding:2px 0;"
+        )
+        self._cv_members_lbl.setWordWrap(True)
+        cv.addWidget(self._cv_members_lbl)
+
+        cv.addWidget(_hdivider())
+        self._cv_L_hdr = _section_lbl("CIRCUIT INDUCTANCE")
+        cv.addWidget(self._cv_L_hdr)
+        self._cv_L_lbl = QLabel("—")
+        self._cv_L_lbl.setStyleSheet(
+            f"color:{THEME['accent']}; font-size:10pt; font-weight:bold;"
+        )
+        cv.addWidget(self._cv_L_lbl)
+
+        self._cv_group_id: str | None = None
+
+    def _emit_cv_current(self, amps: float) -> None:
+        if self._cv_group_id is not None:
+            self.circuit_current_changed.emit(self._cv_group_id, float(amps))
+
+    def show_circuit_view(self, group_id: str, group_info: dict,
+                           member_names: list, L_henries: float | None) -> None:
+        """Show the circuit-level Properties view for `group_id`."""
+        self._probe_w.hide()
+        self._coil_w.hide()
+        self._circuit_w.show()
+        self._sum_w.hide()
+        self._cv_group_id = group_id
+        self._cv_name_lbl.setText(group_info.get('name', group_id))
+        kind = group_info.get('kind', 'series').capitalize()
+        color = group_info.get('color', THEME.get('accent', '#e06a2a'))
+        self._cv_kind_lbl.setText(f"{kind} wiring")
+        # Accent the header with the group's color
+        self._circuit_hdr.setStyleSheet(
+            f"color:{color}; font-size:7pt; font-weight:600; letter-spacing:2px;"
+        )
+        # Block-signal-set the current spinbox to the group's value
+        self._cv_dspin_current.blockSignals(True)
+        self._cv_dspin_current.setValue(float(group_info.get('current', 0.0)))
+        self._cv_dspin_current.blockSignals(False)
+        # Member list
+        n = len(member_names)
+        if member_names:
+            text = f"({n} coils)  " + ", ".join(member_names)
+        else:
+            text = "(no members)"
+        self._cv_members_lbl.setText(text)
+        # Inductance
+        self.update_circuit_inductance(group_id, L_henries)
+
+    def update_circuit_inductance(self, group_id: str,
+                                    L_henries: float | None) -> None:
+        """Update just the circuit-view L reading. Used by the background
+        L-matrix worker to swap the "computing…" placeholder for the real
+        value without re-rendering the whole circuit panel."""
+        if getattr(self, '_cv_group_id', None) != group_id:
+            return
+        if L_henries is None:
+            self._cv_L_lbl.setText("computing…")
+        elif L_henries >= 1.0:
+            self._cv_L_lbl.setText(f"{L_henries:.3f} H")
+        elif L_henries >= 1e-3:
+            self._cv_L_lbl.setText(f"{L_henries*1e3:.3f} mH")
+        else:
+            self._cv_L_lbl.setText(f"{L_henries*1e6:.2f} µH")
+
+    def set_coil_current_editable(self, editable: bool,
+                                    inherited_from: str | None = None,
+                                    inherited_value: float | None = None) -> None:
+        """When a coil is in a circuit, the Current row must not be edited
+        per-coil (it's driven by the circuit). Hide the spinbox + label and
+        show an informational note instead."""
+        if editable:
+            self._current_form_label.setVisible(True)
+            self.dspin_current.setVisible(True)
+            self.dspin_current.setEnabled(True)
+            self._inherited_current_lbl.hide()
+        else:
+            self._current_form_label.setVisible(False)
+            self.dspin_current.setVisible(False)
+            val = inherited_value if inherited_value is not None else 0.0
+            src = inherited_from or "circuit"
+            self._inherited_current_lbl.setText(
+                f"Current {val:.1f} A — inherited from {src}"
+            )
+            self._inherited_current_lbl.show()
+
     def show_coil_controls(self) -> None:
         """Swap back to coil-params view (summary visibility is caller's choice)."""
         self._probe_w.hide()
+        self._circuit_w.hide()
         self._coil_w.show()
+
+    def set_circuit_banner(self, group_info: dict | None) -> None:
+        """Show a "Circuit: NAME (kind, N coils)" banner at the top of the
+        Properties panel when the active coil belongs to a circuit group.
+        Pass None to hide."""
+        if not group_info:
+            self._circuit_banner.hide()
+            return
+        name = group_info.get('name', 'Circuit')
+        kind = group_info.get('kind', 'series').capitalize()
+        n    = len(group_info.get('coil_ids', []))
+        color = group_info.get('color', THEME.get('accent', '#e06a2a'))
+        self._circuit_banner.setStyleSheet(
+            f"color:{THEME['text']}; font-size:8pt; font-weight:600; "
+            f"padding:2px 4px; border-left:3px solid {color};"
+        )
+        self._circuit_banner.setText(f"  {name}  •  {kind}  •  {n} coils")
+        self._circuit_banner.show()
+
+    def set_summary_row_visible(self, key: str, visible: bool) -> None:
+        """Show or hide a single row of the results summary by key name.
+        Used to hide per-coil Induct. when a coil is part of a circuit
+        family (the circuit's L is the meaningful value there)."""
+        row = self._sum_rows.get(key)
+        if row is not None:
+            row.setVisible(visible)
+
+    def set_multi_edit_banner(self, n_coils: int, mixed_keys: list | None = None) -> None:
+        """Show a banner indicating that multiple coils are being edited in
+        bulk. Pass n_coils=0 (or 1) to clear. mixed_keys lists parameter names
+        whose values differ across the selection; the banner names them so the
+        user knows what will be overwritten on any spinbox change."""
+        if n_coils < 2:
+            self._multi_banner.hide()
+            return
+        if mixed_keys:
+            detail = "  •  differs: " + ", ".join(mixed_keys)
+        else:
+            detail = ""
+        self._multi_banner.setText(f"Editing {n_coils} coils{detail}")
+        self._multi_banner.show()
+
+    def show_bobbin_view(self) -> None:
+        """Bobbins are visual-only imports — hide all physics parameter
+        controls and the results summary. Browser entry stays interactive
+        (name, colour, visibility, delete, transform)."""
+        self._probe_w.hide()
+        self._coil_w.hide()
+        self._circuit_w.hide()
+        self._sum_w.hide()
 
     def update_probe_position_display(self, position) -> None:
         """Live-update the XYZ spinboxes without emitting signals (used when
@@ -1504,10 +2174,6 @@ class PropertiesPanel(QScrollArea):
         try:
             if engine.self_inductance is not None:
                 _set("Induct.", _fmt_L(engine.self_inductance))
-        except Exception: pass
-        try:
-            Lv = getattr(engine, 'self_inductance_volumetric', None)
-            _set("Induct.(vol)", _fmt_L(Lv) if Lv is not None else "—")
         except Exception: pass
         try:
             if engine.stored_energy is not None:
@@ -1799,6 +2465,10 @@ class MainWindow(QMainWindow):
         self._i_thread         = None
         self._i_worker         = None
         self._inspect_reporter = None
+        # Background L-matrix precompute (warms _multi_env._L_cache so the
+        # first circuit-header click doesn't freeze the UI).
+        self._lmx_thread = None
+        self._lmx_worker = None
 
         # Multi-coil tracking
         self._coil_counter   = 0                # auto-increment for unique IDs
@@ -1806,6 +2476,16 @@ class MainWindow(QMainWindow):
         self._coil_paths:    dict = {}          # coil_id → CSV file path (absolute)
         self._coil_coords:   dict = {}          # coil_id → np.ndarray
         self._active_coil_id:    str | None = None
+        self._multi_edit_ids:    list = []          # IDs of coils in a bulk-edit selection (len>=2); empty otherwise
+        # Circuit groups: each group_id → {kind: 'series'|'parallel',
+        #                                   coil_ids: list,
+        #                                   signs: {coil_id → ±1},
+        #                                   color: hex, name: str}
+        # Coils not in any group are treated as their own 1-coil circuit.
+        self._circuit_groups:    dict = {}
+        self._coil_group_map:    dict = {}          # coil_id → group_id (if grouped)
+        self._circuit_counter:   int  = 0
+        self._active_circuit_id: str | None = None
         self._analyzed_coil_id:  str | None = None   # coil that owns the in-progress analysis
         self._coil_engines:      dict       = {}      # coil_id → CoilAnalysis engine
         self._coil_inspect_cache:  dict     = {}      # coil_id → {field_lines, field_mags, cross_section}
@@ -1878,7 +2558,13 @@ class MainWindow(QMainWindow):
         self.browser.coil_delete_requested.connect(self._on_coil_delete)
         self.browser.layer_delete_requested.connect(self._on_layer_delete)
         self.browser.coil_selected.connect(self._on_coil_selected)
+        self.browser.coils_multi_selected.connect(self._on_coils_multi_selected)
         self.browser.coil_renamed.connect(self._on_coil_renamed)
+        self.ribbon.group_as_series.connect(self._on_group_as_series)
+        self.ribbon.group_as_parallel.connect(self._on_group_as_parallel)
+        self.ribbon.ungroup_selection.connect(self._on_ungroup_selection)
+        self.browser.circuit_selected.connect(self._on_circuit_selected)
+        self.props.circuit_current_changed.connect(self._on_circuit_current_changed)
         self.browser.coil_recolored.connect(self._on_coil_recolored)
         self.ribbon.open_settings.connect(self._on_open_settings)
         self.ribbon.save_session.connect(lambda: self._save_session(self))
@@ -2128,7 +2814,46 @@ class MainWindow(QMainWindow):
             self.workspace._plotter.reset_camera()
             self.workspace._plotter.render()
 
+    def _snapshot_camera(self):
+        """Return an opaque snapshot of the workspace camera state, or None
+        if unavailable. Used to protect camera view across destructive
+        operations that may trigger an implicit VTK reset_camera."""
+        plotter = getattr(self.workspace, '_plotter', None)
+        if plotter is None:
+            return None
+        try:
+            cam = plotter.renderer.GetActiveCamera()
+            return (
+                cam.GetPosition(),
+                cam.GetFocalPoint(),
+                cam.GetViewUp(),
+                cam.GetParallelScale(),
+                cam.GetViewAngle(),
+            )
+        except Exception:
+            return None
+
+    def _restore_camera(self, snapshot) -> None:
+        """Restore a previously snapshotted camera state and render once."""
+        plotter = getattr(self.workspace, '_plotter', None)
+        if plotter is None or snapshot is None:
+            return
+        try:
+            cam = plotter.renderer.GetActiveCamera()
+            cam.SetPosition(*snapshot[0])
+            cam.SetFocalPoint(*snapshot[1])
+            cam.SetViewUp(*snapshot[2])
+            cam.SetParallelScale(snapshot[3])
+            cam.SetViewAngle(snapshot[4])
+            plotter.render()
+        except Exception:
+            pass
+
     def _on_coil_delete(self, coil_id: str) -> None:
+        # Preserve the camera view across the delete — otherwise an implicit
+        # reset from removing actors / rebuilding the floor would snap the
+        # view back to the default framing.
+        cam_snap = self._snapshot_camera()
         # Bobbin display mesh — stored as a layer, not a coil
         if coil_id.startswith('bobbin_'):
             key = (coil_id, 'Bobbin')
@@ -2143,6 +2868,7 @@ class MainWindow(QMainWindow):
                 del self.workspace._layers[key]
                 self.workspace._plotter.render()
             self.browser.remove_coil_item(coil_id)
+            self._restore_camera(cam_snap)
             return
 
         # Clear analysis layers and engine for this coil
@@ -2150,6 +2876,15 @@ class MainWindow(QMainWindow):
         self._coil_engines.pop(coil_id, None)
         self._coil_inspect_cache.pop(coil_id, None)
         self._multi_env.unregister_coil(coil_id)
+        # Drop this coil from any circuit group; dissolve the group if it
+        # falls below 2 members.
+        gid = self._coil_group_map.pop(coil_id, None)
+        if gid and gid in self._circuit_groups:
+            g = self._circuit_groups[gid]
+            g['coil_ids'] = [c for c in g['coil_ids'] if c != coil_id]
+            g['signs'].pop(coil_id, None)
+            if len(g['coil_ids']) < 2:
+                self._dissolve_group(gid)
         self._propagate_staleness()
         if coil_id == self._analyzed_coil_id:
             self._analyzed_coil_id = None
@@ -2167,9 +2902,12 @@ class MainWindow(QMainWindow):
         if not self._coil_coords:
             self.ribbon.set_construct_enabled(False)
             self.ribbon.set_inspect_enabled(False)
+        # Restore the pre-delete camera so the view doesn't jump
+        self._restore_camera(cam_snap)
 
     def _on_layer_delete(self, coil_id: str, layer_name: str) -> None:
         """Delete a user-created sub-layer (Cross Section or Field Lines)."""
+        cam_snap = self._snapshot_camera()
         if layer_name == 'Cross Section':
             self.workspace.clear_cross_section_layer(coil_id)
             self.browser.remove_layer_from_coil(coil_id, 'Cross Section')
@@ -2190,26 +2928,111 @@ class MainWindow(QMainWindow):
                     self._coil_inspect_cache.pop(coil_id, None)
             # Re-unify the remaining field-line scale bar
             self.workspace.rescale_all_field_line_layers()
+        self._restore_camera(cam_snap)
 
     def _refresh_summary_for(self, coil_id: str) -> None:
-        """Populate the Properties summary from the coil's engine, if any."""
+        """Populate the Properties summary from the coil's engine, if any.
+        If the coil is part of a circuit group, also compute and push the
+        circuit-level inductance into the summary and show a group banner."""
         engine = self._coil_engines.get(coil_id)
         if engine is not None:
             self.props.update_summary(engine)
+        gid = self._coil_group_map.get(coil_id)
+        if gid:
+            g = self._circuit_groups[gid]
+            self.props.set_circuit_banner(g)
+            # Hide per-coil Induct. row — the circuit L is the meaningful
+            # value for a grouped coil.
+            self.props.set_summary_row_visible('Induct.', False)
+            self.props.set_summary_row_visible('Circuit L', True)
+            # Only compute synchronously if the L-matrix cache is warm —
+            # otherwise defer to the background worker to avoid freezing
+            # the UI on coil selection.
+            env = self._multi_env
+            cache = getattr(env, '_L_cache', None)
+            engine_ids = list(getattr(env, '_engines', {}).keys())
+            cache_warm = (cache is not None
+                          and cache.get('coil_ids') == engine_ids)
+            L_c = None
+            if cache_warm:
+                try:
+                    L_c = self._compute_circuit_inductance(gid)
+                except Exception:
+                    L_c = None
+            else:
+                self._schedule_l_matrix_precompute()
+            if hasattr(self.props, '_sum_lbls') \
+                    and 'Circuit L' in self.props._sum_lbls:
+                if L_c is None:
+                    self.props._sum_lbls['Circuit L'].setText("computing…")
+                else:
+                    if L_c >= 1.0:
+                        txt = f"{L_c:.3f} H"
+                    elif L_c >= 1e-3:
+                        txt = f"{L_c*1e3:.3f} mH"
+                    else:
+                        txt = f"{L_c*1e6:.2f} µH"
+                    self.props._sum_lbls['Circuit L'].setText(txt)
+        else:
+            self.props.set_circuit_banner(None)
+            # Ungrouped coil — show per-coil self-inductance, hide Circuit L
+            self.props.set_summary_row_visible('Induct.', True)
+            self.props.set_summary_row_visible('Circuit L', False)
+            if hasattr(self.props, '_sum_lbls') \
+                    and 'Circuit L' in self.props._sum_lbls:
+                self.props._sum_lbls['Circuit L'].setText("—")
 
     def _on_coil_selected(self, coil_id: str) -> None:
-        # Save current coil's spinbox values before switching
+        # Save current coil's spinbox values before switching.
         old_cid = self._active_coil_id
-        if old_cid and old_cid in self._coil_params_map:
-            self._coil_params_map[old_cid].update(self.props.get_params())
+        if old_cid and old_cid in self._coil_params_map and not self._multi_edit_ids:
+            ui_params = self.props.get_params()
+            # If the old coil is inside a circuit, its Current spinbox was
+            # hidden and carries the stale pre-group value. Dropping it
+            # here prevents that stale value from clobbering the branch
+            # current the circuit just wrote into _coil_params_map.
+            if old_cid in self._coil_group_map:
+                ui_params.pop('current', None)
+            self._coil_params_map[old_cid].update(ui_params)
+        # Note: multi-edit state is owned by `_on_coils_multi_selected`, which
+        # fires right after this from the tree's selectionChanged signal with
+        # the authoritative list. Don't clear it here — that would stomp on
+        # a just-built multi selection and cause the banner to flash off.
         self._active_coil_id = coil_id
+        self._active_circuit_id = None
         self._coords = self._coil_coords.get(coil_id)
         # Switch gizmo target back to coil
         self.workspace.set_gizmo_target('coil')
+        # Bobbin layers are visual-only — no physics params to show.
+        if coil_id.startswith('bobbin_'):
+            self.props.show_bobbin_view()
+            self.workspace.set_active_coil(coil_id)
+            if self.ribbon._btn_translate.isChecked():
+                self.workspace.show_gizmo('T')
+            elif self.ribbon._btn_rotate.isChecked():
+                self.workspace.show_gizmo('R')
+            return
         # Swap Properties back to coil view
         self.props.show_coil_controls()
         # Load the new coil's params into spinboxes
         self._load_coil_params(coil_id)
+        # If this coil is part of a circuit, hide per-coil Current and show
+        # an inheritance note with the actual BRANCH current (for parallel
+        # circuits this is the circuit total divided across branches, not
+        # the circuit total itself).
+        gid = self._coil_group_map.get(coil_id)
+        if gid and gid in self._circuit_groups:
+            g = self._circuit_groups[gid]
+            branch_I = float(self._coil_params_map.get(coil_id, {}).get(
+                'current', g.get('current', 0.0)
+            ))
+            self.props.set_coil_current_editable(
+                False,
+                inherited_from=g.get('name', gid),
+                inherited_value=branch_I,
+            )
+        else:
+            self.props.set_coil_current_editable(True)
         self.workspace.set_active_coil(coil_id)
         # Show the selected coil's analysis summary if available
         self._refresh_summary_for(coil_id)
@@ -2219,29 +3042,459 @@ class MainWindow(QMainWindow):
         elif self.ribbon._btn_rotate.isChecked():
             self.workspace.show_gizmo('R')
 
-    def _on_coil_param_changed(self) -> None:
-        """A spinbox value changed — mark the active coil's analysis stale
-        and rebuild its tube mesh to reflect the new winding dimensions."""
-        cid = self._active_coil_id
-        if not cid:
+    def _on_coils_multi_selected(self, coil_ids: list) -> None:
+        """Authoritative multi-selection handler. Called by the browser on
+        *every* selection change (including when the selection collapses to
+        one or zero coils), so it decides whether to enter or leave
+        multi-edit / circuit-ready mode.
+
+        ≥ 2 selected → enter multi-edit: banner shown, bulk-edit broadcast
+                        active, CIRCUITS ribbon enabled.
+          1 selected → ignore here (single-coil routing is done by the
+                        ``coil_selected`` → ``_on_coil_selected`` path that
+                        fires on click).
+          0 selected → leave multi-edit state; keep active coil as-is.
+        """
+        coil_ids = [cid for cid in coil_ids if cid in self._coil_params_map]
+        if len(coil_ids) >= 2:
+            # Save any in-flight edits on the currently-displayed coil first
+            if self._active_coil_id and self._active_coil_id in self._coil_params_map \
+                    and not self._multi_edit_ids:
+                ui_params = self.props.get_params()
+                if self._active_coil_id in self._coil_group_map:
+                    ui_params.pop('current', None)
+                self._coil_params_map[self._active_coil_id].update(ui_params)
+            self._multi_edit_ids = list(coil_ids)
+            self._active_coil_id = coil_ids[0]
+            self.props.show_coil_controls()
+            self._load_coil_params(coil_ids[0])
+            # Flag parameters that differ across the selection
+            mixed: list = []
+            first = self._coil_params_map[coil_ids[0]]
+            for key, label in (('winds', 'Winds'), ('current', 'Current'),
+                               ('thickness', 'Thick'), ('width', 'Width'),
+                               ('axis_num', 'Axis')):
+                ref = first.get(key)
+                if any(self._coil_params_map[c].get(key) != ref
+                       for c in coil_ids[1:]):
+                    mixed.append(label)
+            self.props.set_multi_edit_banner(len(coil_ids), mixed)
+            any_grouped = any(cid in self._coil_group_map for cid in coil_ids)
+            self.ribbon.set_circuit_enabled(group_ok=True,
+                                             ungroup_ok=any_grouped)
             return
-        # Update stored params — merge UI values into existing dict
-        # so that non-UI fields (tape_normals, etc.) are preserved.
-        prev = self._coil_params_map.get(cid, {})
-        prev.update(self.props.get_params())
-        self._coil_params_map[cid] = prev
-        # Update superposition environment (marks all coils stale)
-        p = self._coil_params_map[cid]
-        self._multi_env.update_coil_params(
-            cid, winds=p['winds'], current=p['current'],
-            thickness=p['thickness'], width=p['width'],
-        )
+        # Single-item or empty selection — leave multi-edit mode. Don't touch
+        # `_active_coil_id` or the Properties display; those are owned by
+        # `_on_coil_selected` (fired on click) or by whatever is left active.
+        if self._multi_edit_ids:
+            self._multi_edit_ids = []
+            self.props.set_multi_edit_banner(0)
+        grouped = (self._active_coil_id in self._coil_group_map
+                   if self._active_coil_id else False)
+        self.ribbon.set_circuit_enabled(group_ok=False, ungroup_ok=grouped)
+
+    # ── Circuit grouping ──────────────────────────────────────────────────
+
+    def _coil_group_colors(self) -> list:
+        """Palette for circuit-group accent colors. Picked to be distinct
+        from the per-coil palette."""
+        return ['#ff9f43', '#4bc0c8', '#ac92ec', '#ed5565',
+                '#48cfad', '#ffcc5c', '#5d9cec', '#a0d468']
+
+    def _next_group_color(self) -> str:
+        palette = self._coil_group_colors()
+        return palette[len(self._circuit_groups) % len(palette)]
+
+    def _on_circuit_selected(self, group_id: str) -> None:
+        """User clicked a circuit folder header in the browser — switch the
+        Properties panel to the circuit-level view (current, L, members)."""
+        g = self._circuit_groups.get(group_id)
+        if not g:
+            return
+        # Clear multi-edit state (a header click isn't a coil multi-edit)
+        self._multi_edit_ids = []
+        self.props.set_multi_edit_banner(0)
+        self._active_circuit_id = group_id
+        member_names = []
+        for cid in g.get('coil_ids', []):
+            member_names.append(self._coil_names.get(cid, cid))
+        # If the L-matrix cache is cold and a background precompute is
+        # running (or can be started), don't block the UI on the full
+        # double-sum here — show a placeholder and let _on_l_matrix_ready
+        # fill it in when the worker finishes.
+        env = self._multi_env
+        cache = getattr(env, '_L_cache', None)
+        engine_ids = list(getattr(env, '_engines', {}).keys())
+        cache_warm = (cache is not None
+                      and cache.get('coil_ids') == engine_ids)
+        if cache_warm:
+            try:
+                L_c = self._compute_circuit_inductance(group_id)
+            except Exception:
+                L_c = None
+        else:
+            L_c = None
+            self._schedule_l_matrix_precompute()
+        self.props.show_circuit_view(group_id, g, member_names, L_c)
+        self.ribbon.set_circuit_enabled(group_ok=False, ungroup_ok=True)
+
+    def _on_circuit_current_changed(self, group_id: str, amps: float) -> None:
+        """Circuit's Current spinbox was changed — propagate the branch-level
+        currents to every member coil, applying the correct split based on
+        circuit kind:
+
+            series   → I_i = s_i · I_total    (same magnitude, signed direction)
+            parallel → I_i = I_total · (L⁻¹ 1)_i / (1ᵀ · L⁻¹ · 1)
+                        (for two identical coils this simplifies to I/2)
+
+        The parallel split uses the full mutual-inductance matrix; for
+        identical coils the off-diagonal M_ij cancels and each branch
+        carries I_total/N regardless of coupling. For non-identical coils
+        the matrix solve captures the impedance-weighted split correctly.
+        """
+        g = self._circuit_groups.get(group_id)
+        if not g:
+            return
+        g['current'] = float(amps)
+        coil_ids = list(g.get('coil_ids', []))
+        kind = g.get('kind', 'series')
+        signs = g.get('signs', {})
+
+        # Compute per-coil branch currents
+        #   parallel → I_total / N  (uniform split; exact for identical coils,
+        #                            which is the practical case. Non-identical
+        #                            parallel branches are mis-modeled by
+        #                            this, but the user can re-analyze for
+        #                            the exact steady-state if needed.)
+        #   series   → I_total · s_i (with ± sign per coil)
+        branch_I: dict = {}
+        if kind == 'parallel' and len(coil_ids) >= 1:
+            per_branch = float(amps) / max(len(coil_ids), 1)
+            for cid in coil_ids:
+                branch_I[cid] = per_branch
+        else:
+            for cid in coil_ids:
+                branch_I[cid] = float(amps) * float(signs.get(cid, 1))
+
+        # Two-pass update:
+        #   Pass 1 — write every circuit member's branch current into the
+        #            params map + multi_env. Each `update_coil_params`
+        #            marks every known coil stale as a side effect, so
+        #            doing this up front means we don't interleave
+        #            re-staling with per-coil rescales.
+        #   Pass 2 — rescale every member's full engine in place.
+        #   Finally — clear staleness for every circuit member (they're all
+        #             now consistent with the circuit's current). Coils
+        #             OUTSIDE the circuit correctly remain stale because
+        #             their B_ext from these members has changed.
+        for cid in coil_ids:
+            if cid not in self._coil_params_map:
+                continue
+            p = self._coil_params_map[cid]
+            p['current'] = float(branch_I.get(cid, 0.0))
+            self._multi_env.update_coil_params(
+                cid, winds=p['winds'], current=p['current'],
+                thickness=p['thickness'], width=p['width'],
+            )
+
+        rescaled_ids: list = []
+        for cid in coil_ids:
+            engine = self._coil_engines.get(cid)
+            if engine is None:
+                # Coil was never analyzed — can't rescale. Leave it stale
+                # so Re-analyze All picks it up.
+                continue
+            target_I = float(branch_I.get(cid, 0.0))
+            try:
+                # force=True: circuit-level current changes scale every
+                # member by the same ratio, so the stored B_ext component
+                # rescales correctly alongside B_self — the
+                # _analyzed_with_ext safety check doesn't apply here.
+                if engine.rescale_to_current(target_I, force=True):
+                    self.workspace.add_force_layer(engine, cid)
+                    self.workspace.add_stress_layer(engine, cid)
+                    self.workspace.add_axis_layer(engine, cid)
+                    rescaled_ids.append(cid)
+            except Exception:
+                pass
+
+        self.workspace.rescale_all_force_layers()
+
+        # Clear staleness ONLY for coils whose engines actually rescaled.
+        # Un-analyzed grouped coils stay stale so Re-analyze All finds them.
+        for cid in rescaled_ids:
+            self._multi_env.mark_fresh(cid)
+            for nm in ('Forces', 'Stress', 'B Axis',
+                       'Field Lines', 'Cross Section'):
+                self.browser.mark_layer_stale(cid, nm, False)
+
         self._propagate_staleness()
-        # Rebuild tube mesh with new dimensions
-        total_t = p['thickness'] * 1e-6 * p['winds']
-        tape_w  = p['width'] * 1e-3
-        self.workspace.update_coil_mesh(cid, total_t, tape_w,
-                                        tape_normals=p.get('tape_normals'))
+        # If a member coil is currently displayed, show its actual branch
+        # current (which differs from the circuit total for parallel wiring).
+        if self._active_coil_id in coil_ids:
+            actual = float(branch_I.get(self._active_coil_id, amps))
+            self.props.set_coil_current_editable(
+                False,
+                inherited_from=g.get('name', group_id),
+                inherited_value=actual,
+            )
+            self._refresh_summary_for(self._active_coil_id)
+
+    def _on_group_as_series(self) -> None:
+        self._create_circuit_group('series')
+
+    def _on_group_as_parallel(self) -> None:
+        self._create_circuit_group('parallel')
+
+    def _create_circuit_group(self, kind: str) -> None:
+        """Build a new circuit group from the current multi-selection.
+        Each coil may only belong to one group; any previous group
+        membership is dissolved first. Reparents the member coils
+        underneath a new folder-like header in the browser."""
+        sel = self.browser.selected_coil_ids()
+        if len(sel) < 2:
+            return
+        # Dissolve any existing groups touched by this selection so coils
+        # don't belong to two groups at once.
+        touched_groups = {self._coil_group_map[cid]
+                          for cid in sel if cid in self._coil_group_map}
+        for gid in touched_groups:
+            self._dissolve_group(gid)
+
+        self._circuit_counter += 1
+        gid = f"circuit_{self._circuit_counter}"
+        color = self._next_group_color()
+        # Initial circuit current inherits from the first selected coil's
+        # current (reasonable default — user can change it via the circuit
+        # view and it'll propagate to all members).
+        first_current = float(
+            self._coil_params_map.get(sel[0], {}).get('current', 0.0)
+        )
+        self._circuit_groups[gid] = {
+            'kind':    kind,
+            'coil_ids': list(sel),
+            'signs':   {cid: 1 for cid in sel},   # all + for MVP
+            'color':   color,
+            'name':    f"Circuit {self._circuit_counter}",
+            'current': first_current,
+        }
+        for cid in sel:
+            self._coil_group_map[cid] = gid
+        # Update the browser: create the header above the first member
+        # (so it reads like a folder), then badge each member coil.
+        name = self._circuit_groups[gid]['name']
+        self.browser.add_circuit_header(gid, name, kind, color,
+                                          insert_above=list(sel))
+        for cid in sel:
+            self.browser.move_coil_under_circuit(cid, gid)
+        # Compute the correct branch-current split (handles parallel → I/N
+        # or L-matrix-weighted, and series → signed total) and push to all
+        # member coils, engines, and visualizations in one place.
+        self._on_circuit_current_changed(gid, first_current)
+        self.ribbon.set_circuit_enabled(group_ok=True, ungroup_ok=True)
+
+    def _on_ungroup_selection(self) -> None:
+        """Dissolve every circuit group that contains a currently-selected coil."""
+        sel = self.browser.selected_coil_ids() or (
+            [self._active_coil_id] if self._active_coil_id else []
+        )
+        touched = {self._coil_group_map[cid]
+                   for cid in sel if cid in self._coil_group_map}
+        for gid in touched:
+            self._dissolve_group(gid)
+        if self._active_coil_id:
+            # Coil is no longer in a circuit — current is editable again
+            if self._active_coil_id not in self._coil_group_map:
+                self.props.set_coil_current_editable(True)
+            self._refresh_summary_for(self._active_coil_id)
+        self.ribbon.set_circuit_enabled(
+            group_ok=len(sel) >= 2,
+            ungroup_ok=False,
+        )
+
+    def _dissolve_group(self, group_id: str) -> None:
+        g = self._circuit_groups.pop(group_id, None)
+        if not g:
+            return
+        for cid in g['coil_ids']:
+            self._coil_group_map.pop(cid, None)
+        # Browser: reparent member coils back to COILS root, delete header
+        self.browser.remove_circuit_header(group_id)
+
+    def _compute_circuit_inductance(self, group_id: str) -> float | None:
+        """Return the effective inductance of a circuit group, in Henries.
+
+        Series (with per-coil signs s_i = ±1):
+            L = Σ_i Σ_j s_i s_j  M_ij
+
+        Parallel (tight-coupling aware — NOT `1 / Σ(1/L_i)`):
+            L = 1 / (1ᵀ · M⁻¹ · 1)
+
+        Requires every coil in the group to have a fresh engine (i.e. the
+        user has run analysis on each). Returns None if unavailable or
+        ill-conditioned."""
+        g = self._circuit_groups.get(group_id)
+        if not g:
+            return None
+        coil_ids = [cid for cid in g['coil_ids'] if cid in self._coil_engines]
+        if len(coil_ids) != len(g['coil_ids']):
+            return None   # some coils not analyzed yet
+        try:
+            M_full = self._multi_env.compute_mutual_inductance_matrix()
+        except Exception:
+            return None
+        full_ids = M_full.get('coil_ids', [])
+        L = M_full.get('L_matrix')
+        if L is None:
+            return None
+        try:
+            idx = [full_ids.index(cid) for cid in coil_ids]
+        except ValueError:
+            return None
+        M_sub = L[np.ix_(idx, idx)]
+        signs = np.array([g['signs'].get(cid, 1) for cid in coil_ids],
+                         dtype=np.float64)
+        kind = g.get('kind', 'series')
+        try:
+            if kind == 'parallel':
+                # L_parallel = 1 / (1ᵀ M⁻¹ 1)
+                Minv = np.linalg.inv(M_sub)
+                ones = np.ones(len(idx), dtype=np.float64)
+                denom = float(ones @ Minv @ ones)
+                if denom <= 0:
+                    return None
+                return 1.0 / denom
+            # series (default)
+            return float(signs @ M_sub @ signs)
+        except np.linalg.LinAlgError:
+            return None
+
+    def _schedule_l_matrix_precompute(self) -> None:
+        """Start (or skip) a background L-matrix compute so the cache is warm
+        before the user clicks a circuit header. No-op when:
+          - no circuit groups exist,
+          - fewer than 2 engines are registered (nothing to compute),
+          - cache is already warm for the current engine set,
+          - a precompute is already running.
+        """
+        if not self._circuit_groups:
+            return
+        env = self._multi_env
+        try:
+            engine_ids = list(env._engines.keys())
+        except Exception:
+            return
+        if len(engine_ids) < 1:
+            return
+        cache = getattr(env, '_L_cache', None)
+        if cache is not None and cache.get('coil_ids') == engine_ids:
+            return
+        if self._lmx_thread is not None and self._lmx_thread.isRunning():
+            return
+        self._lmx_thread = QThread(self)
+        self._lmx_worker = LMatrixWorker(env)
+        self._lmx_worker.moveToThread(self._lmx_thread)
+        self._lmx_worker.finished.connect(self._on_l_matrix_ready)
+        self._lmx_worker.finished.connect(self._lmx_thread.quit)
+        self._lmx_worker.finished.connect(self._lmx_worker.deleteLater)
+        self._lmx_thread.finished.connect(self._lmx_thread.deleteLater)
+        self._lmx_thread.started.connect(self._lmx_worker.run)
+        self._lmx_thread.start()
+
+    def _on_l_matrix_ready(self, coil_ids) -> None:
+        """Background L-matrix compute finished — cache is now warm. Refresh
+        the Properties panel if a circuit view or grouped coil is showing so
+        its L reading updates from the placeholder."""
+        self._lmx_thread = None
+        self._lmx_worker = None
+        if coil_ids is None:
+            return
+        gid = getattr(self, '_active_circuit_id', None)
+        if gid and gid in self._circuit_groups:
+            try:
+                L_c = self._compute_circuit_inductance(gid)
+            except Exception:
+                L_c = None
+            if L_c is not None:
+                self.props.update_circuit_inductance(gid, L_c)
+        elif self._active_coil_id \
+                and self._active_coil_id in self._coil_group_map:
+            self._refresh_summary_for(self._active_coil_id)
+
+    def _on_coil_param_changed(self) -> None:
+        """A spinbox value changed — apply it to the active coil (or all coils
+        in a multi-edit selection). When the change is current-only and the
+        coil was analyzed without an external B-field, rescale the engine's
+        results in place (O(n) refresh) instead of marking it stale for a
+        full Biot-Savart re-sum. Otherwise fall back to the stale path."""
+        ui_params = self.props.get_params()
+        if self._multi_edit_ids:
+            targets = list(self._multi_edit_ids)
+        elif self._active_coil_id:
+            targets = [self._active_coil_id]
+        else:
+            return
+
+        geom_keys = ('winds', 'thickness', 'width', 'axis_num')
+        for cid in targets:
+            old = dict(self._coil_params_map.get(cid, {}))
+            new = dict(old)
+            new.update(ui_params)
+            # If this coil is part of a circuit, current is owned by the
+            # circuit — never let the per-coil UI overwrite it here.
+            gid = self._coil_group_map.get(cid)
+            if gid and gid in self._circuit_groups:
+                new['current'] = float(
+                    self._circuit_groups[gid].get('current', old.get('current', 0.0))
+                )
+            self._coil_params_map[cid] = new
+
+            only_current_changed = (
+                old.get('current') != new.get('current')
+                and all(old.get(k) == new.get(k) for k in geom_keys)
+            )
+            engine = self._coil_engines.get(cid)
+            rescaled = False
+            if only_current_changed and engine is not None:
+                try:
+                    rescaled = bool(engine.rescale_to_current(new['current']))
+                except Exception:
+                    rescaled = False
+
+            # Keep MultiCoilEnvironment in sync — this also marks every
+            # coil stale (including this one, which we clear below if the
+            # rescale succeeded).
+            self._multi_env.update_coil_params(
+                cid, winds=new['winds'], current=new['current'],
+                thickness=new['thickness'], width=new['width'],
+            )
+
+            if rescaled:
+                # Push the rescaled engine data into the visualization in
+                # place — no tube rebuild needed (geometry unchanged).
+                self.workspace.add_force_layer(engine, cid)
+                self.workspace.add_stress_layer(engine, cid)
+                self.workspace.add_axis_layer(engine, cid)
+                self.workspace.rescale_all_force_layers()
+                # This coil's analysis is still current after the rescale.
+                self._multi_env.mark_fresh(cid)
+                for nm in ('Forces', 'Stress', 'B Axis',
+                           'Field Lines', 'Cross Section'):
+                    self.browser.mark_layer_stale(cid, nm, False)
+                # Refresh Properties summary if it's the visible coil
+                if (not self._multi_edit_ids and cid == self._active_coil_id) \
+                        or (targets and cid == targets[0]):
+                    self.props.update_summary(engine)
+            else:
+                # Geometry changed or external field present — rebuild the
+                # tube mesh and let the user click Re-analyze to recompute.
+                total_t = new['thickness'] * 1e-6 * new['winds']
+                tape_w  = new['width'] * 1e-3
+                self.workspace.update_coil_mesh(
+                    cid, total_t, tape_w,
+                    tape_normals=new.get('tape_normals'),
+                )
+        self._propagate_staleness()
 
     def _load_coil_params(self, coil_id: str) -> None:
         """Load per-coil parameters into PropertiesPanel spinboxes."""
@@ -2281,7 +3534,12 @@ class MainWindow(QMainWindow):
         cid_save = self._active_coil_id
         if (cid_save and cid_save in self._coil_params_map
                 and not getattr(self, '_reanalyze_queue', None)):
-            self._coil_params_map[cid_save].update(self.props.get_params())
+            ui_params = self.props.get_params()
+            # Current is owned by the circuit when this coil is grouped —
+            # don't overwrite the branch current with a stale UI value.
+            if cid_save in self._coil_group_map:
+                ui_params.pop('current', None)
+            self._coil_params_map[cid_save].update(ui_params)
 
         self.ribbon.set_run_enabled(False)
         self.ribbon.set_inspect_enabled(False)
@@ -2342,9 +3600,17 @@ class MainWindow(QMainWindow):
         def _force_progress(done, total):
             self.reporter.report(87 + int(8 * done / max(total, 1)))
 
-        self.workspace.add_force_layer(
+        force_scalars = self.workspace.add_force_layer(
             engine, cid, progress_callback=_force_progress,
         )
+        # Cache the per-tube-vertex scalars so session save can embed
+        # them in the .calcsx. On reload, add_force_layer_from_scalars
+        # bypasses the per-vertex Biot-Savart sweep — that's the one
+        # step in load that scales with tube_mesh resolution × n_fil
+        # and drives the 82→100% wall time on a large coil.
+        if force_scalars is not None:
+            self._coil_inspect_cache.setdefault(cid, {})['force_scalars'] = \
+                np.asarray(force_scalars, dtype=np.float32)
 
         self.reporter.set_stage("Building stress & field layers…")
         self.reporter.report(95)
@@ -2394,6 +3660,10 @@ class MainWindow(QMainWindow):
         # Continue re-analyze-all queue if active
         elif getattr(self, '_reanalyze_queue', None):
             self._reanalyze_next()
+        else:
+            # Warm the L-matrix cache in the background so the first
+            # circuit-header click doesn't block the UI.
+            self._schedule_l_matrix_precompute()
 
     def _on_reanalyze_all(self) -> None:
         """Re-run analysis on ALL coils sequentially."""
@@ -2408,6 +3678,8 @@ class MainWindow(QMainWindow):
             self.ribbon._btn_reanalyze.set_action_enabled(False)
             # All coils done — now apply the global force colour scale
             self.workspace.rescale_all_force_layers()
+            # Warm the L-matrix cache once the full queue is drained.
+            self._schedule_l_matrix_precompute()
             return
         if self._a_thread is not None and self._a_thread.isRunning():
             return  # wait for current analysis to finish
@@ -2441,13 +3713,13 @@ class MainWindow(QMainWindow):
                            and getattr(self, '_global_fl_cache_seeds', 0) == n_seeds)
             if cache_valid:
                 lines, B_mags = self._global_fl_cache
-                self.workspace.add_field_lines_layer(lines, B_mags, '__global__')
+                self.workspace.add_field_lines_layer(lines, B_mags, 'global')
                 self.workspace.rescale_all_field_line_layers()
             else:
                 self._compute_global_field_lines()
         else:
             # Remove global field lines layer
-            self.workspace.clear_field_lines_layer('__global__')
+            self.workspace.clear_field_lines_layer('global')
             # Restore per-coil field lines to their pre-global eye state
             self.ribbon._btn_field_lines.set_action_enabled(True)
             for cid in list(self._coil_coords.keys()):
@@ -2484,7 +3756,7 @@ class MainWindow(QMainWindow):
         self._global_fl_cache = (lines, B_mags)
         self._global_fl_cache_seeds = self.props.get_field_seeds()
         self._global_fl_dirty = False
-        self.workspace.add_field_lines_layer(lines, B_mags, '__global__')
+        self.workspace.add_field_lines_layer(lines, B_mags, 'global')
         self.workspace.rescale_all_field_line_layers()
 
     def _on_compute_field_lines(self) -> None:
@@ -2765,7 +4037,7 @@ class MainWindow(QMainWindow):
                 del self.workspace._layers[(bid, lname)]
                 self.browser.remove_coil_item(bid)
         # Clear global field lines
-        self.workspace.clear_field_lines_layer('__global__')
+        self.workspace.clear_field_lines_layer('global')
         if self.ribbon._btn_global_field.isChecked():
             self.ribbon._btn_global_field.blockSignals(True)
             self.ribbon._btn_global_field.setChecked(False)
@@ -2788,6 +4060,9 @@ class MainWindow(QMainWindow):
             self._probe_timer.stop()
             self._probe_timer = None
         self._multi_env = MultiCoilEnvironment()
+        self._circuit_groups.clear()
+        self._coil_group_map.clear()
+        self._circuit_counter = 0
         self._active_coil_id = None
         self._analyzed_coil_id = None
         self._coords = None
@@ -2842,12 +4117,14 @@ class MainWindow(QMainWindow):
                 except Exception as exc:
                     sys.stderr.write(
                         f"[save_session] engine pickle failed for {coil_id}: "
-                        f"{type(exc).__name__}: {exc}\n"
+                        f"{type(exc).name}: {exc}\n"
                     )
                 finally:
                     engine._B_ext = saved_B_ext
 
-            # Serialize cached inspection results (field lines, cross section)
+            # Serialize cached inspection results (field lines, cross section,
+            # per-tube-vertex force scalars — saving the latter avoids the
+            # expensive per-vertex Biot-Savart recompute on session load.)
             ic = self._coil_inspect_cache.get(coil_id)
             inspect = None
             if ic is not None:
@@ -2860,6 +4137,9 @@ class MainWindow(QMainWindow):
                 if 'cross_section' in ic:
                     cs = ic['cross_section']
                     inspect['cross_section'] = {k: _jsonable(v) for k, v in cs.items()}
+                if 'force_scalars' in ic:
+                    fs = np.asarray(ic['force_scalars'], dtype=np.float32)
+                    inspect['force_scalars'] = fs.tolist()
                 if not inspect:
                     inspect = None
 
@@ -2925,6 +4205,19 @@ class MainWindow(QMainWindow):
                 'uvw':      [float(uvw[0]), float(uvw[1]), float(uvw[2])],
             })
 
+        # Serialise circuit groups (kind, coil_ids, signs, color, name, current)
+        circuits = []
+        for gid, g in self._circuit_groups.items():
+            circuits.append({
+                'group_id': gid,
+                'kind':     g.get('kind', 'series'),
+                'coil_ids': list(g.get('coil_ids', [])),
+                'signs':    {cid: int(s) for cid, s in g.get('signs', {}).items()},
+                'color':    g.get('color'),
+                'name':     g.get('name', gid),
+                'current':  float(g.get('current', 0.0)),
+            })
+
         with open(path, 'w') as f:
             json.dump({
                 'version': 3,
@@ -2932,6 +4225,7 @@ class MainWindow(QMainWindow):
                 'bobbins': bobbins,
                 'global_field_lines': global_fl,
                 'hall_probes': probes,
+                'circuits': circuits,
             }, f, indent=2)
 
         n_xsec = sum(
@@ -2981,6 +4275,7 @@ class MainWindow(QMainWindow):
         coil_entries = list(data.get('coils', []))
         bobbin_entries = list(data.get('bobbins') or [])
         probe_entries  = list(data.get('hall_probes') or [])
+        circuit_entries = list(data.get('circuits') or [])
         n_coils   = len(coil_entries)
         n_bobbins_planned = len(bobbin_entries)
         n_probes_planned  = len(probe_entries)
@@ -3083,9 +4378,31 @@ class MainWindow(QMainWindow):
                 try:
                     engine = pickle.loads(base64.b64decode(engine_b64))
                     engine._B_ext = self._multi_env.make_external_field_func(coil_id)
+                    # Ensure the rescale-metadata attributes exist on engines
+                    # loaded from .calcsx files saved before these were added.
+                    if not hasattr(engine, '_analysis_current'):
+                        engine._analysis_current = float(
+                            getattr(engine, 'current', 0.0) or 0.0
+                        )
+                    if not hasattr(engine, '_analyzed_with_ext'):
+                        engine._analyzed_with_ext = (engine._B_ext is not None)
                     self._coil_engines[coil_id] = engine
-                    # Rebuild the standard analysis layers from the engine
-                    self.workspace.add_force_layer(engine, coil_id)
+                    # Rebuild the standard analysis layers. For Forces,
+                    # prefer pre-computed per-vertex scalars stored in the
+                    # .calcsx (saved at analysis time) to skip the O(n_verts
+                    # × n_sources × n_fil) per-vertex Biot-Savart sweep —
+                    # the dominant cost of session load on large coils.
+                    inspect_data = entry.get('inspect') or {}
+                    fs_saved = inspect_data.get('force_scalars')
+                    if fs_saved is not None:
+                        fs_arr = np.asarray(fs_saved, dtype=np.float32)
+                        self.workspace.add_force_layer_from_scalars(
+                            coil_id, fs_arr,
+                        )
+                        self._coil_inspect_cache.setdefault(
+                            coil_id, {})['force_scalars'] = fs_arr
+                    else:
+                        self.workspace.add_force_layer(engine, coil_id)
                     self.workspace.add_stress_layer(engine, coil_id)
                     self.workspace.add_axis_layer(engine, coil_id)
                     self.browser.add_layer_to_coil(coil_id, 'Forces')
@@ -3096,7 +4413,7 @@ class MainWindow(QMainWindow):
                 except Exception as exc:
                     sys.stderr.write(
                         f"[load_session] engine unpickle failed for {coil_id}: "
-                        f"{type(exc).__name__}: {exc}\n"
+                        f"{type(exc).name}: {exc}\n"
                     )
                     import traceback
                     traceback.print_exc()
@@ -3185,7 +4502,7 @@ class MainWindow(QMainWindow):
             self._global_fl_cache = (lines, B_mags)
             self._global_fl_cache_seeds = int(gfl.get('seeds', 0))
             self._global_fl_dirty = False
-            self.workspace.add_field_lines_layer(lines, B_mags, '__global__')
+            self.workspace.add_field_lines_layer(lines, B_mags, 'global')
             any_field_lines_restored = True
 
         # ── Restore Hall probes ──
@@ -3214,6 +4531,7 @@ class MainWindow(QMainWindow):
                     'uvw':      uvw,
                     'name':     name,
                 }
+                self.browser.update_probe_parent_label(pid, coil_ref, mode)
                 # Bump counter past the loaded probe's numeric id so newly
                 # created probes don't collide.
                 try:
@@ -3233,6 +4551,54 @@ class MainWindow(QMainWindow):
             self._probe_timer.timeout.connect(self._update_all_probe_readouts)
             self._probe_timer.start()
 
+        # Restore circuit groups
+        self._circuit_groups = {}
+        self._coil_group_map = {}
+        max_circuit_counter = 0
+        for centry in circuit_entries:
+            try:
+                gid = centry['group_id']
+                coil_ids = [cid for cid in centry.get('coil_ids', [])
+                            if cid in self._coil_coords]
+                if len(coil_ids) < 2:
+                    continue
+                signs_in = centry.get('signs', {}) or {}
+                signs = {cid: int(signs_in.get(cid, 1)) for cid in coil_ids}
+                # Restore circuit current from file, fallback to first coil's
+                first_current = float(
+                    centry.get('current',
+                        self._coil_params_map.get(coil_ids[0], {}).get('current', 0.0))
+                )
+                color = centry.get('color', self._next_group_color())
+                name = centry.get('name', gid)
+                kind = centry.get('kind', 'series')
+                self._circuit_groups[gid] = {
+                    'kind':     kind,
+                    'coil_ids': coil_ids,
+                    'signs':    signs,
+                    'color':    color,
+                    'name':     name,
+                    'current':  first_current,
+                }
+                for cid in coil_ids:
+                    self._coil_group_map[cid] = gid
+                    # Unify every member's per-coil current to the circuit's
+                    self._coil_params_map.setdefault(cid, {})['current'] = first_current
+                # Rebuild the browser folder header + badge member coils
+                self.browser.add_circuit_header(gid, name, kind, color,
+                                                  insert_above=list(coil_ids))
+                for cid in coil_ids:
+                    self.browser.move_coil_under_circuit(cid, gid)
+                try:
+                    max_circuit_counter = max(
+                        max_circuit_counter, int(gid.rsplit('_', 1)[-1])
+                    )
+                except ValueError:
+                    pass
+            except Exception:
+                pass
+        self._circuit_counter = max(self._circuit_counter, max_circuit_counter)
+
         # Unify colour scales across restored layers
         self._load_reporter.set_stage("Finalizing…")
         self._load_reporter.report(99)
@@ -3245,6 +4611,9 @@ class MainWindow(QMainWindow):
         self.ribbon.set_construct_enabled(bool(self._coil_coords))
         if self._active_coil_id:
             self._load_coil_params(self._active_coil_id)
+            # _refresh_summary_for now defers the L-matrix compute to the
+            # background worker when the cache is cold, so it's safe to
+            # call synchronously even for grouped coils.
             self._refresh_summary_for(self._active_coil_id)
         self.props.show()
         if self.workspace._plotter:
@@ -3252,6 +4621,9 @@ class MainWindow(QMainWindow):
             self.workspace._plotter.render()
         self._load_reporter.finish()
         self._load_reporter = None
+        # Kick off the L-matrix precompute in the background so the first
+        # circuit-header click after load is instant.
+        self._schedule_l_matrix_precompute()
 
         n_xsec_loaded = sum(
             1 for c in self._coil_inspect_cache.values()
@@ -3315,6 +4687,9 @@ class MainWindow(QMainWindow):
             'uvw':      (0.0, 0.0, 0.0),
             'name':     f"Probe {self._probe_counter}",
         }
+        self.browser.update_probe_parent_label(
+            probe_id, self._active_coil_id, 'xyz'
+        )
 
         # Start the shared readout timer if not already running
         if self._probe_timer is None:
@@ -3504,6 +4879,7 @@ class MainWindow(QMainWindow):
                 uvw = self._xyz_to_pca(st['coil_ref'], pos)
                 st['uvw'] = uvw
                 self.props.update_probe_pca_display(*uvw)
+        self.browser.update_probe_parent_label(pid, st.get('coil_ref'), mode)
 
     def _propagate_staleness(self) -> None:
         """Reflect MultiCoilEnvironment staleness into browser stale markers."""
@@ -3517,7 +4893,7 @@ class MainWindow(QMainWindow):
 
         # Auto-clear global field lines — they're invalid now
         if self.ribbon._btn_global_field.isChecked():
-            self.workspace.clear_field_lines_layer('__global__')
+            self.workspace.clear_field_lines_layer('global')
             self.ribbon._btn_global_field.blockSignals(True)
             self.ribbon._btn_global_field.setChecked(False)
             self.ribbon._btn_global_field.blockSignals(False)

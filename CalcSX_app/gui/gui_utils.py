@@ -296,14 +296,14 @@ QToolButton:hover {{ background: {THEME['tool_bg_hover']}; border-color: {THEME[
 /* ── structural helpers (objectName-based, auto-refresh on theme switch) ── */
 QFrame#hdivider {{ color: {THEME['border']}; }}
 QFrame#vbar     {{ color: {THEME['border']}; }}
-QLabel#section_lbl {{ color: {THEME['text_dim']}; font-size: 7pt; letter-spacing: 1.5px; }}
+QLabel#section_lbl {{ color: {THEME['text_dim']}; font-size:7pt; letter-spacing: 1.5px; }}
 QLabel#ribbon_grp_lbl {{
-    color: {THEME['text_dim']}; font-size: 7pt;
+    color: {THEME['text_dim']}; font-size:7pt;
     border-top: 1px solid {THEME['border']}; padding-top: 1px;
 }}
-QLabel#dim_label {{ color: {THEME['text_dim']}; font-size: 8pt; }}
+QLabel#dim_label {{ color: {THEME['text_dim']}; font-size:8pt; }}
 QPushButton#coil_del {{
-    color: {THEME['text_dim']}; font-size: 10pt; border: none;
+    color: {THEME['text_dim']}; font-size:10pt; border: none;
     background: transparent; padding: 0;
 }}
 QPushButton#coil_del:hover {{ color: {THEME['del_hover']}; }}

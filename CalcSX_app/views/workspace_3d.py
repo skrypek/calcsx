@@ -959,6 +959,7 @@ class Workspace3DView(QWidget):
             line_width=1.1,
             opacity=0.70,
             render=False,
+            reset_camera=False,
         )
         self._floor_actors.append(a)
 
@@ -1077,13 +1078,21 @@ class Workspace3DView(QWidget):
     def add_bobbin_mesh(
         self, bobbin_id: str, mesh, color: str = '#888888', opacity: float = 0.2,
     ) -> None:
-        """Render a bobbin/former solid as a translucent mesh."""
+        """Render a bobbin/former solid as a translucent mesh.
+
+        ``show_edges`` is off by default — Fusion-exported bobbins can be
+        tens of thousands of triangles, and edge rendering dominates the
+        .bobsx import wall time (VTK has to draw each triangle boundary
+        as a separate line primitive). Flat shading still shows the
+        bobbin clearly as a translucent reference object; turn edges
+        back on via the scene settings if you need wireframe detail.
+        """
         if self._plotter is None:
             return
         try:
             a = self._plotter.add_mesh(
                 mesh, color=color, opacity=opacity,
-                show_edges=True, edge_color=THEME.get('edge', '#404040'),
+                show_edges=False,
                 reset_camera=False, render=False,
             )
             # Store as a layer so it can be toggled
@@ -1165,6 +1174,23 @@ class Workspace3DView(QWidget):
     def remove_coil(self, coil_id: str) -> None:
         if coil_id not in self._coil_entries or self._plotter is None:
             return
+        # Snapshot the full camera state BEFORE removing anything — any
+        # implicit camera reset triggered by actor removal / mesh add in the
+        # layer-cleanup or floor-rebuild steps would otherwise be baked in
+        # before we even save it.
+        cam_state = None
+        try:
+            cam = self._plotter.renderer.GetActiveCamera()
+            cam_state = (
+                cam.GetPosition(),
+                cam.GetFocalPoint(),
+                cam.GetViewUp(),
+                cam.GetParallelScale(),
+                cam.GetViewAngle(),
+            )
+        except Exception:
+            pass
+
         for actor in self._coil_entries[coil_id]['actors']:
             try:
                 self._plotter.remove_actor(actor, render=False)
@@ -1193,18 +1219,18 @@ class Workspace3DView(QWidget):
             all_coords = np.vstack([e['coords'] for e in self._coil_entries.values()])
             self._rebuild_floor(all_coords)
 
-        # Preserve camera position — don't reset view on delete
-        try:
-            vtk_cam = self._plotter.renderer.GetActiveCamera()
-            pos = vtk_cam.GetPosition()
-            foc = vtk_cam.GetFocalPoint()
-            vup = vtk_cam.GetViewUp()
-            self._plotter.render()
-            vtk_cam.SetPosition(pos)
-            vtk_cam.SetFocalPoint(foc)
-            vtk_cam.SetViewUp(vup)
-        except Exception:
-            self._plotter.render()
+        # Restore the pre-delete camera state and render once.
+        if cam_state is not None:
+            try:
+                cam = self._plotter.renderer.GetActiveCamera()
+                cam.SetPosition(*cam_state[0])
+                cam.SetFocalPoint(*cam_state[1])
+                cam.SetViewUp(*cam_state[2])
+                cam.SetParallelScale(cam_state[3])
+                cam.SetViewAngle(cam_state[4])
+            except Exception:
+                pass
+        self._plotter.render()
 
     def set_active_coil(self, coil_id: str) -> None:
         if coil_id not in self._coil_entries:
