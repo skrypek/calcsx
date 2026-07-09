@@ -4,7 +4,7 @@ build-backend = "briefcase.backend"
 
 [tool.briefcase]
 project_name = "CalcSX_app"
-version      = "2.3.0"
+version      = "2.4.0"
 bundle       = "sx.calc.calcsx"
 
 [tool.briefcase.app.CalcSX_app]
