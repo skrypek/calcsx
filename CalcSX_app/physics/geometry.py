@@ -222,6 +222,42 @@ def generate_solenoid(
     return coords
 
 
+def generate_circular_loop(
+    radius: float = 1.0,
+    n_pts: int = 400,
+    center: np.ndarray = None,
+) -> np.ndarray:
+    """
+    Single flat closed-loop circle in the xy-plane.
+
+    Intended as the centerline for axisymmetric rectangular-cross-section
+    coils (e.g. TEAM Problem 22 SMES solenoids): radial thickness and axial
+    height are supplied by the volumetric REBCO model via the Properties
+    panel (winds × tape_thickness = radial, tape_width = axial), so the
+    centerline itself is just a one-turn circle.
+
+    Parameters
+    ----------
+    radius : coil radius in metres.
+    n_pts  : number of samples around the loop. The returned array has
+             ``n_pts + 1`` rows; the last point equals the first to close
+             the curve explicitly.
+    center : (3,) loop center; default origin.
+
+    Returns (n_pts + 1, 3) coordinate array.
+    """
+    if center is None:
+        center = np.zeros(3)
+    center = np.asarray(center, dtype=np.float64)
+
+    theta = np.linspace(0.0, 2.0 * np.pi, n_pts + 1)
+    x = radius * np.cos(theta)
+    y = radius * np.sin(theta)
+    z = np.zeros_like(theta)
+    coords = np.column_stack([x, y, z]) + center
+    return coords
+
+
 def generate_racetrack(
     R_end: float = 0.2,
     L_straight: float = 0.5,

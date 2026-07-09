@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QLabel,
+    QApplication,
 )
 from PyQt5.QtCore import Qt, QObject, QEvent
 
@@ -182,6 +183,13 @@ class _TransformGizmo:
             while delta >  180.: delta -= 360.
             while delta < -180.: delta += 360.
             new_cumul[3 + self._drag_axis] += delta
+            # Shift-to-snap: Fusion/Solidworks convention — hold Shift while
+            # dragging to lock the cumulative angle on the active axis to the
+            # nearest 90°. Applied to the total (not the delta) so the snap
+            # feels stable instead of jittering each frame.
+            if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+                ang = new_cumul[3 + self._drag_axis]
+                new_cumul[3 + self._drag_axis] = round(ang / 90.0) * 90.0
             self._update_dot(x, y, self._drag_axis)
         self._cumul = new_cumul
         self._sync_pos()
@@ -721,6 +729,9 @@ class Workspace3DView(QWidget):
         self._gizmo_target:  str = 'coil'   # 'coil' or 'probe'
         self._probe_entries: dict[str, dict] = {}  # probe_id → {position, xfm_params}
         self._active_probe_id: str | None = None
+        # Transient red direction arrows shown while the user edits the
+        # Current spinbox. Hidden the rest of the time.
+        self._current_arrow_actors: list = []
 
         if not _HAS_PYVISTA:
             lbl = QLabel(
@@ -971,6 +982,7 @@ class Workspace3DView(QWidget):
                           tape_width: float,
                           tape_normals: 'np.ndarray | None' = None,
                           n_r: int = 4, n_a: int = 2,
+                          winding_growth: str = 'symmetric',
                           ) -> 'pv.PolyData | None':
         """Build a swept winding-pack mesh with per-turn grid structure.
 
@@ -987,11 +999,25 @@ class Workspace3DView(QWidget):
             if n < 3:
                 return None
 
+            # Detect explicit loop closure (c[0] == c[-1]). Closed loops need
+            # periodic central differences at the boundaries; otherwise the
+            # forward/backward-difference scheme leaves the tangent (and
+            # therefore the cross-section orientation) tilted by ±half a
+            # discretization step at the endpoints, which produces a visible
+            # twist + sliver at the closure point.
+            is_closed = bool(np.allclose(c[0], c[-1]))
+
             # ── local frame per vertex ──
             tangents = np.empty_like(c)
             tangents[1:-1] = c[2:] - c[:-2]
-            tangents[0]    = c[1] - c[0]
-            tangents[-1]   = c[-1] - c[-2]
+            if is_closed and n >= 3:
+                # Use periodic central diff: the "previous" point of the
+                # closure (c[0] == c[-1]) is c[-2], and the "next" is c[1].
+                tangents[0]  = c[1] - c[-2]
+                tangents[-1] = tangents[0]
+            else:
+                tangents[0]  = c[1] - c[0]
+                tangents[-1] = c[-1] - c[-2]
             t_mag = np.linalg.norm(tangents, axis=1, keepdims=True).clip(1e-12)
             tangents /= t_mag
 
@@ -1015,19 +1041,32 @@ class Workspace3DView(QWidget):
 
             T  = total_thickness
             ha = tape_width * 0.5
-            r_vals = np.linspace(0.0, T, n_r + 1)
+            # Match the physics layout: 'symmetric' centers the pack on the
+            # centerline; 'up' places the centerline at the floor (groove
+            # surface) and stacks outward only.
+            if winding_growth == 'up':
+                r_vals = np.linspace(0.0, T, n_r + 1)
+            else:
+                r_vals = np.linspace(-0.5 * T, 0.5 * T, n_r + 1)
             a_vals = np.linspace(-ha, ha, n_a + 1)
+            # Inner / outer radial edges of the cross-section. Read from
+            # r_vals so the perimeter wraps correctly in BOTH growth modes —
+            # an earlier hardcoded `0.0` / `T` produced a Z-shaped perimeter
+            # in symmetric mode that pulled the outer face outward by T/2 and
+            # left a visible diagonal gap at the corners.
+            r_inner = float(r_vals[0])
+            r_outer = float(r_vals[-1])
 
             # ── perimeter offsets (CCW around cross-section) ──
-            peri = []                       # list of (dr, da)
-            for ri in range(n_r):           # bottom: a=-ha, r ascending
+            peri = []                                  # list of (dr, da)
+            for ri in range(n_r):                      # bottom: a=-ha, r ascending
                 peri.append((r_vals[ri], -ha))
-            for ai in range(n_a):           # right:  r=T,   a ascending
-                peri.append((T, a_vals[ai]))
-            for ri in range(n_r, 0, -1):    # top:    a=+ha, r descending
+            for ai in range(n_a):                      # right:  r=r_outer, a ascending
+                peri.append((r_outer, a_vals[ai]))
+            for ri in range(n_r, 0, -1):               # top:    a=+ha, r descending
                 peri.append((r_vals[ri], ha))
-            for ai in range(n_a, 0, -1):    # left:   r=0,   a descending
-                peri.append((0.0, a_vals[ai]))
+            for ai in range(n_a, 0, -1):               # left:   r=r_inner, a descending
+                peri.append((r_inner, a_vals[ai]))
             n_peri = len(peri)              # = 2*(n_r + n_a)
 
             # ── surface vertices: n × n_peri ──
@@ -1045,19 +1084,23 @@ class Workspace3DView(QWidget):
                     faces.extend([4, b0 + j, b0 + j1, b1 + j1, b1 + j])
 
             # ── end caps (full grid) ──
+            # Skip endcaps for closed loops: index 0 and index n-1 sit at the
+            # same physical point, so two endcaps would overlap and produce a
+            # bright "cross-section" sliver at the closure.
             cap_pts_list = []
-            cap_base = n * n_peri
-            stride = n_a + 1
-            for ci_cap in (0, n - 1):
-                local_base = cap_base + len(cap_pts_list)
-                for ri in range(n_r + 1):
-                    for ai in range(n_a + 1):
-                        pt = c[ci_cap] + r_vals[ri] * e_r[ci_cap] + a_vals[ai] * e_b[ci_cap]
-                        cap_pts_list.append(pt.astype(np.float32))
-                for ri in range(n_r):
-                    for ai in range(n_a):
-                        v0 = local_base + ri * stride + ai
-                        faces.extend([4, v0, v0 + 1, v0 + stride + 1, v0 + stride])
+            if not is_closed:
+                cap_base = n * n_peri
+                stride = n_a + 1
+                for ci_cap in (0, n - 1):
+                    local_base = cap_base + len(cap_pts_list)
+                    for ri in range(n_r + 1):
+                        for ai in range(n_a + 1):
+                            pt = c[ci_cap] + r_vals[ri] * e_r[ci_cap] + a_vals[ai] * e_b[ci_cap]
+                            cap_pts_list.append(pt.astype(np.float32))
+                    for ri in range(n_r):
+                        for ai in range(n_a):
+                            v0 = local_base + ri * stride + ai
+                            faces.extend([4, v0, v0 + 1, v0 + stride + 1, v0 + stride])
 
             all_pts = surf_pts
             if cap_pts_list:
@@ -1103,7 +1146,8 @@ class Workspace3DView(QWidget):
 
     def add_coil(self, coords: np.ndarray, coil_id: str, color: str = None,
                   total_thickness: float = 0.0, tape_width: float = 0.0,
-                  tape_normals: 'np.ndarray | None' = None) -> None:
+                  tape_normals: 'np.ndarray | None' = None,
+                  winding_growth: str = 'symmetric') -> None:
         """Add (or replace) a coil in the scene without clearing other coils.
 
         If total_thickness and tape_width are > 0, the coil renders as a
@@ -1131,7 +1175,8 @@ class Workspace3DView(QWidget):
         tube_ok = total_thickness > 0 and tape_width > 0
         if tube_ok:
             tube_mesh = self._build_tube_mesh(c, total_thickness, tape_width,
-                                                tape_normals=tape_normals)
+                                                tape_normals=tape_normals,
+                                                winding_growth=winding_growth)
             if tube_mesh is not None:
                 a_tube = self._plotter.add_mesh(
                     tube_mesh, color='#b0b0b0', opacity=0.75,
@@ -1250,7 +1295,8 @@ class Workspace3DView(QWidget):
 
     def update_coil_mesh(self, coil_id: str,
                           total_thickness: float, tape_width: float,
-                          tape_normals: 'np.ndarray | None' = None) -> None:
+                          tape_normals: 'np.ndarray | None' = None,
+                          winding_growth: str = 'symmetric') -> None:
         """Rebuild a coil's visual mesh (tube + wire) after parameter changes,
         preserving transforms and analysis layers."""
         entry = self._coil_entries.get(coil_id)
@@ -1274,7 +1320,8 @@ class Workspace3DView(QWidget):
         tube_ok = total_thickness > 0 and tape_width > 0
         if tube_ok:
             tube_mesh = self._build_tube_mesh(c, total_thickness, tape_width,
-                                               tape_normals=tape_normals)
+                                               tape_normals=tape_normals,
+                                               winding_growth=winding_growth)
             if tube_mesh is not None:
                 a_tube = self._plotter.add_mesh(
                     tube_mesh, color='#b0b0b0', opacity=0.75,
@@ -2186,6 +2233,135 @@ class Workspace3DView(QWidget):
             if not remaining:
                 self._gizmo_target = 'coil'
         if self._plotter:
+            self._plotter.render()
+
+    # ── Stray-field probe array ──────────────────────────────────────────
+    def add_stray_array(self, array_id: str, positions: 'np.ndarray',
+                        color: str = '#80c0ff') -> None:
+        """Render a fixed-position array of measurement points as small spheres.
+
+        Read-only — no gizmo, no per-point selection. Positions are passed
+        through unchanged; ProjectView samples B at each position when
+        recomputing the array's aggregate readouts.
+        """
+        if self._plotter is None:
+            return
+        positions = np.asarray(positions, dtype=np.float64)
+        if positions.ndim != 2 or positions.shape[1] != 3 or len(positions) == 0:
+            return
+        # Drop any existing actors for this array.
+        self.remove_stray_array(array_id)
+
+        # Sphere size: ~1.5 % of scene bbox diagonal (or 0.05 m default).
+        scene_bbox = 1.0
+        if self._coil_entries:
+            some_coords = next(iter(self._coil_entries.values())).get('coords')
+            if some_coords is not None:
+                scene_bbox = float(_ptp(np.asarray(some_coords), axis=0).max())
+        radius = max(scene_bbox * 0.015, 1e-3)
+
+        try:
+            cloud = pv.PolyData(positions.astype(np.float32))
+            spheres = cloud.glyph(geom=pv.Sphere(radius=radius), scale=False)
+            # Strip data so add_mesh doesn't hijack the active scalar
+            # (same hazard as the current-direction arrows).
+            spheres.clear_data()
+            actor = self._plotter.add_mesh(
+                spheres, color=color, show_scalar_bar=False,
+                reset_camera=False, render=False, lighting=False,
+            )
+            self._layers[(array_id, 'Stray Array')] = _Layer(
+                'Stray Array', actors=[actor],
+            )
+            self._plotter.render()
+        except Exception:
+            pass
+
+    def remove_stray_array(self, array_id: str) -> None:
+        """Remove the spheres for the given stray-array id (no-op if absent)."""
+        self._remove_layer(array_id, 'Stray Array')
+        if self._plotter is not None:
+            self._plotter.render()
+
+    # ── Transient current-direction indicator ────────────────────────────
+    def show_current_arrows(self, coil_id: str, current: float,
+                            n_arrows: int = 16) -> None:
+        """Render red tangent-aligned cone glyphs around a coil's centerline.
+
+        Used as a live visual cue while the user edits the Current spinbox:
+        arrows point along +tangent for I > 0 and reverse for I < 0, so the
+        sign convention is unambiguous before the user runs analysis.
+        Repeated calls replace the existing arrows (no need to hide first).
+        """
+        if self._plotter is None or coil_id not in self._coil_entries:
+            return
+        self.hide_current_arrows()
+        coords = self.get_transformed_coords(coil_id)
+        if coords is None:
+            coords = self._coil_entries[coil_id].get('coords')
+        if coords is None or len(coords) < 4:
+            return
+        coords = np.asarray(coords, dtype=np.float64)
+        n = len(coords)
+
+        # Tangents at every vertex — periodic central diff for closed loops.
+        tangents = np.empty_like(coords)
+        tangents[1:-1] = coords[2:] - coords[:-2]
+        is_closed = bool(np.allclose(coords[0], coords[-1]))
+        if is_closed and n >= 3:
+            tangents[0]  = coords[1] - coords[-2]
+            tangents[-1] = tangents[0]
+        else:
+            tangents[0]  = coords[1] - coords[0]
+            tangents[-1] = coords[-1] - coords[-2]
+        tmag = np.linalg.norm(tangents, axis=1, keepdims=True).clip(1e-12)
+        tangents = tangents / tmag
+
+        # Sample n_arrows uniformly around the loop, skipping the duplicate
+        # closure vertex if present.
+        n_unique = n - 1 if is_closed else n
+        if n_unique <= 0:
+            return
+        step = max(1, n_unique // max(1, n_arrows))
+        idx = np.arange(0, n_unique, step)[:n_arrows]
+
+        sign = -1.0 if float(current) < 0 else 1.0
+        positions = coords[idx].astype(np.float32)
+        directions = (tangents[idx] * sign).astype(np.float32)
+
+        # Arrow size: ~5 % of the coil's bounding-box diagonal.
+        bbox = coords.max(axis=0) - coords.min(axis=0)
+        scale = float(np.linalg.norm(bbox)) * 0.05 or 0.1
+
+        try:
+            # Use plotter.add_arrows directly rather than building a glyph
+            # PolyData with a 'vec' point-data array. The latter leaves 'vec'
+            # as the active scalar on the new actor, which can hijack the
+            # shared force-layer scalar bar and visually wipe out the force
+            # gradient. add_arrows builds the glyph internally and returns a
+            # plain colored actor with no scalar mapping.
+            actor = self._plotter.add_arrows(
+                positions, directions, mag=scale, color='red',
+                show_scalar_bar=False, reset_camera=False, render=False,
+                lighting=False,
+            )
+            if actor is not None:
+                self._current_arrow_actors.append(actor)
+            self._plotter.render()
+        except Exception:
+            pass
+
+    def hide_current_arrows(self) -> None:
+        """Remove all red current-direction arrows from the scene."""
+        if not self._current_arrow_actors:
+            return
+        for actor in self._current_arrow_actors:
+            try:
+                self._plotter.remove_actor(actor, render=False)
+            except Exception:
+                pass
+        self._current_arrow_actors = []
+        if self._plotter is not None:
             self._plotter.render()
 
     def apply_probe_transform(

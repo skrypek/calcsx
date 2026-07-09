@@ -5,7 +5,7 @@ from sklearn.decomposition import PCA
 
 class CoilAnalysis:
     def __init__(self, coords, winds, current, thickness_microns, tape_width_mm,
-                 B_ext=None, tape_normals=None):
+                 B_ext=None, tape_normals=None, winding_growth='symmetric'):
         # raw inputs
         self.compute_bfield_enabled = False
         self.coords = coords
@@ -18,6 +18,15 @@ class CoilAnalysis:
         # Supplied tape-face normals from bobbin geometry.
         # (n, 3) array — if provided, used instead of Frenet-Serret inference.
         self._supplied_tape_normals = tape_normals
+        # Stack growth direction:
+        #   'symmetric' — pack extends ±total_thickness/2 around the centerline
+        #                 (mean-radius solenoid model; TEAM 22 SMES style).
+        #   'up'        — pack extends 0..total_thickness in the +e_r direction
+        #                 (centerline at the floor; bobbin-import style).
+        # Used by _build_filament_grid to position sub-filaments correctly.
+        self._winding_growth = (
+            'up' if winding_growth == 'up' else 'symmetric'
+        )
         # convert units (meters and total thickness)
         self.thickness = thickness_microns * 1e-6 # m per turn
         self.total_thickness = self.thickness * winds # total coil thickness
@@ -244,7 +253,56 @@ class CoilAnalysis:
         # is unsafe. The MainWindow checks this flag before using rescale.
         self._analyzed_with_ext = self._B_ext is not None
 
+        # Freeze copies of every current-dependent array at the analysis
+        # current. rescale_to_current() recomputes from these snapshots
+        # rather than mutating the display arrays in place — that way
+        # going through I=0 is recoverable (the snapshots stay non-zero
+        # even after a rescale wipes the display arrays).
+        self._snapshot_for_rescale()
+
         return self
+
+    def _snapshot_for_rescale(self) -> None:
+        """Capture B / F / σ / energy arrays + the analysis current.
+
+        Snapshots are read-only after this point; rescale_to_current uses
+        them as the reference so the scale always goes from the original
+        analysis state, not from whatever the last rescale produced.
+        Without this, rescale-through-zero permanently destroys the field
+        arrays (k=0 wipes them, then I_old=0 blocks further rescales).
+        """
+        def _copy(arr):
+            try:
+                import numpy as _np
+                return _np.copy(arr) if arr is not None else None
+            except Exception:
+                return None
+        self._orig_analysis_current = float(self.current)
+        self._orig_B_total          = _copy(self.B_total)
+        self._orig_B_magnitude      = (float(self.B_magnitude)
+                                       if self.B_magnitude is not None else None)
+        self._orig_B_axial          = (float(self.B_axial)
+                                       if getattr(self, 'B_axial', None) is not None else None)
+        self._orig_bfield_axis_mag  = _copy(getattr(self, 'bfield_axis_mag', None))
+        self._orig_F_vecs           = _copy(self.F_vecs)
+        self._orig_F_seg_mags       = _copy(getattr(self, 'F_seg_mags', None))
+        self._orig_F_mags           = _copy(self.F_mags)
+        self._orig_hoop_stress      = _copy(getattr(self, 'hoop_stress', None))
+        self._orig_total_hoop_force = (float(self.total_hoop_force)
+                                       if self.total_hoop_force is not None else None)
+        self._orig_avg_pressure     = (float(self.avg_pressure)
+                                       if self.avg_pressure is not None else None)
+        self._orig_stored_energy    = (float(self.stored_energy)
+                                       if self.stored_energy is not None else None)
+        # cross_section_data is a tuple (X, Y, B_plane, e1, e2, center, R).
+        # Snapshot the |B| array specifically; the rest is geometry.
+        cs = getattr(self, 'cross_section_data', None)
+        self._orig_cross_section_B = None
+        if cs is not None:
+            try:
+                self._orig_cross_section_B = _copy(cs[2])
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Dynamic current rescaling (no re-analysis)
@@ -273,61 +331,68 @@ class CoilAnalysis:
         if not force and getattr(self, '_analyzed_with_ext', False):
             # External field mixed in — can't rescale self-contribution alone.
             return False
-        # Fall back to self.current if _analysis_current wasn't stored on
-        # this engine (e.g., loaded from a .calcsx saved before the
-        # attribute was introduced). Using the engine's current field is
-        # correct: its stored B / F arrays correspond to that current.
-        I_old = getattr(self, '_analysis_current', None)
-        if I_old is None:
-            I_old = getattr(self, 'current', None)
-        if I_old is None:
+        # Prefer the immutable original-current snapshot (set once at the
+        # end of run_analysis). Older sessions saved before this attribute
+        # existed fall back to _analysis_current; both as a last resort to
+        # self.current. Snapshotting from the *original* lets rescale-
+        # through-zero be reversible.
+        I_orig = getattr(self, '_orig_analysis_current', None)
+        if I_orig is None:
+            I_orig = getattr(self, '_analysis_current', None)
+        if I_orig is None:
+            I_orig = getattr(self, 'current', None)
+        if I_orig is None or abs(float(I_orig)) < 1e-30:
             return False
-        I_old = float(I_old)
-        I_new = float(new_current)
-        if abs(I_old) < 1e-30:
-            return False
-        k = I_new / I_old
+        I_orig = float(I_orig)
+        I_new  = float(new_current)
+        k  = I_new / I_orig
         k2 = k * k
 
+        # Snapshots — built on first call if missing (e.g., session loaded
+        # from an older .calcsx that pre-dates _snapshot_for_rescale).
+        if not hasattr(self, '_orig_F_vecs'):
+            self._snapshot_for_rescale()
+
         # Linear (∝ I) quantities — magnetic field
-        if self.B_total is not None:
-            self.B_total = self.B_total * k
-        if self.B_magnitude is not None:
-            self.B_magnitude = float(self.B_magnitude) * abs(k)
-        if getattr(self, 'B_axial', None) is not None:
-            self.B_axial = float(self.B_axial) * abs(k)
-        if getattr(self, 'bfield_axis_mag', None) is not None:
-            self.bfield_axis_mag = self.bfield_axis_mag * abs(k)
+        if self._orig_B_total is not None:
+            self.B_total = self._orig_B_total * k
+        if self._orig_B_magnitude is not None:
+            self.B_magnitude = self._orig_B_magnitude * abs(k)
+        if self._orig_B_axial is not None:
+            self.B_axial = self._orig_B_axial * abs(k)
+        if self._orig_bfield_axis_mag is not None:
+            self.bfield_axis_mag = self._orig_bfield_axis_mag * abs(k)
         cs = getattr(self, 'cross_section_data', None)
-        if cs is not None:
-            # Expected format: (X, Y, B_plane, e1, e2, center, R) with B_plane
-            # a 2D array of |B| values. Rescale only if it looks right.
+        if cs is not None and self._orig_cross_section_B is not None:
             try:
-                X, Y, B_plane, *rest = cs
-                self.cross_section_data = (X, Y, B_plane * abs(k), *rest)
+                X, Y, _B_plane, *rest = cs
+                self.cross_section_data = (
+                    X, Y, self._orig_cross_section_B * abs(k), *rest,
+                )
             except Exception:
                 pass
 
         # Quadratic (∝ I²) quantities — forces, stress, stored energy
-        if self.F_vecs is not None:
-            self.F_vecs = self.F_vecs * k2
-        if getattr(self, 'F_seg_mags', None) is not None:
-            self.F_seg_mags = self.F_seg_mags * abs(k2)
-        if self.F_mags is not None:
-            # F_mags is F_seg_mags / segment_length, so same I² scaling.
-            self.F_mags = self.F_mags * abs(k2)
-        if getattr(self, 'hoop_stress', None) is not None:
-            self.hoop_stress = self.hoop_stress * k2
-        if self.total_hoop_force is not None:
-            self.total_hoop_force = float(self.total_hoop_force) * k2
-        if self.avg_pressure is not None:
-            self.avg_pressure = float(self.avg_pressure) * k2
-        if self.stored_energy is not None:
-            self.stored_energy = float(self.stored_energy) * k2
+        if self._orig_F_vecs is not None:
+            self.F_vecs = self._orig_F_vecs * k2
+        if self._orig_F_seg_mags is not None:
+            self.F_seg_mags = self._orig_F_seg_mags * abs(k2)
+        if self._orig_F_mags is not None:
+            self.F_mags = self._orig_F_mags * abs(k2)
+        if self._orig_hoop_stress is not None:
+            self.hoop_stress = self._orig_hoop_stress * k2
+        if self._orig_total_hoop_force is not None:
+            self.total_hoop_force = self._orig_total_hoop_force * k2
+        if self._orig_avg_pressure is not None:
+            self.avg_pressure = self._orig_avg_pressure * k2
+        if self._orig_stored_energy is not None:
+            self.stored_energy = self._orig_stored_energy * k2
         # self.self_inductance — geometry only, unchanged.
 
         self.current = I_new
-        self._analysis_current = I_new
+        # NOTE: _analysis_current is intentionally NOT updated here. The
+        # snapshots remain the reference; mutating _analysis_current would
+        # silently re-baseline the scale and break recovery from I=0.
         return True
 
     # ------------------------------------------------------------------
@@ -501,21 +566,36 @@ class CoilAnalysis:
         # distribute into n_r radial × n_a axial sub-filaments; n_r ≤ 6,
         # n_a ≤ 2 bounds the cold-compute cost at ~12² × 200² ≈ 6M ops per
         # coil pair (well under a second on a laptop).
-        if n_r <= 0:
-            if self.winds <= 1:
-                n_r = 1
-            else:
-                # Cap at 4: PEEC self-L pair-sum cost scales as n_r² × n_a²
-                # × axis_num². Going n_r=4 → 4² = 16 sub-filaments per coil
-                # (vs 36 at n_r=6) cuts analysis time by 2.25× with ~1–2 %
-                # accuracy loss on the R=0.3 m circle validation set.
-                n_r = min(int(self.winds), 4)
-        if n_a <= 0:
-            if self.winds <= 1:
-                n_a = 1
-            else:
-                ratio = self.tape_width / max(self.total_thickness, 1e-10)
-                n_a = max(1, min(2, int(round(ratio))))
+        # Auto-scale law (reworked, task #34): pick n_r × n_a so the sub-cells
+        # are as SQUARE as the cross-section allows, under a fixed filament
+        # budget. The cross-section is total_thickness (radial) × tape_width
+        # (axial). The old law (n_r = min(winds, 16), n_a ≤ 2) over-resolved
+        # the radial direction and under-resolved a wide tape: for the TEAM-22
+        # inner pack (0.27 m × 1.6 m) it produced 0.017 m × 0.8 m sub-cells —
+        # a 47:1 aspect ratio — so the within-filament GMD regularisation
+        # (first-order in sub-cell size) was accurate radially but coarse
+        # axially, inflating the self-L ~+25%. Square-ish cells make the GMD
+        # term accurate in both directions and converge L to the independent
+        # Maxwell reference (verified: inner self-L 53→45 mH, ~+6% vs 42.6 mH
+        # truth, vs +25% before; outer 0.0%). Cells stay square as the budget
+        # grows, so refining _FH_FIL_BUDGET converges monotonically.
+        if (n_r <= 0 or n_a <= 0) and self.winds <= 1:
+            n_r = n_r if n_r > 0 else 1
+            n_a = n_a if n_a > 0 else 1
+        elif n_r <= 0 or n_a <= 0:
+            t_ext = max(float(self.total_thickness), 1e-12)   # radial extent
+            w_ext = max(float(self.tape_width), 1e-12)        # axial extent
+            budget = float(CoilAnalysis._FH_FIL_BUDGET)
+            # Square cells: n_a/n_r = w_ext/t_ext, with n_r*n_a ≈ budget.
+            aspect = w_ext / t_ext
+            nr_f = float(np.sqrt(budget / aspect))
+            na_f = float(np.sqrt(budget * aspect))
+            auto_r = max(1, min(int(round(nr_f)), int(self.winds), 16))
+            auto_a = max(1, min(int(round(na_f)), 12))
+            if n_r <= 0:
+                n_r = auto_r
+            if n_a <= 0:
+                n_a = auto_a
 
         # Remember the grid dimensions so downstream code (distributed-filament
         # inductance) can use the right sub-cell GMD regularisation.
@@ -538,7 +618,13 @@ class CoilAnalysis:
         # REBCO: radial extent = total_thickness, axial extent = tape_width
         half_r = self.total_thickness * 0.5     # radial half-extent
         half_a = self.tape_width * 0.5          # axial half-extent
-        r_phys = r_nodes * half_r    # (n_r,) radial offsets in metres
+        # 'symmetric': r_phys spans [-half_r, +half_r] (centerline at middle).
+        # 'up'       : r_phys spans [0, total_thickness] (centerline at floor).
+        # Width direction is always symmetric.
+        if getattr(self, '_winding_growth', 'symmetric') == 'up':
+            r_phys = (r_nodes + 1.0) * half_r
+        else:
+            r_phys = r_nodes * half_r    # (n_r,) radial offsets in metres
         a_phys = a_nodes * half_a    # (n_a,) axial offsets in metres
 
         # 2D weights (outer product, normalized so they sum to 1)
@@ -566,10 +652,18 @@ class CoilAnalysis:
             r_mag = np.linalg.norm(radial, axis=1, keepdims=True).clip(1e-10)
             e_r = radial / r_mag
 
-        # Tangent at each vertex (forward difference, wrap for closed coil)
+        # Tangent at each vertex. Default forward difference, with periodic
+        # central diff at the boundaries when the loop is closed (c[0] == c[-1]).
+        # Without the periodic fix, the segment crossing the closure has a
+        # near-zero or misaligned dl that the Biot-Savart kernel turns into a
+        # singular "hot spot" on top of the closure point.
         tangent = np.empty_like(self.coords)
         tangent[:-1] = self.coords[1:] - self.coords[:-1]
-        tangent[-1] = tangent[-2] if len(tangent) > 1 else np.array([1, 0, 0])
+        if len(tangent) >= 3 and np.allclose(self.coords[0], self.coords[-1]):
+            tangent[-1] = self.coords[1] - self.coords[-2]
+            tangent[0]  = tangent[-1]
+        else:
+            tangent[-1] = tangent[-2] if len(tangent) > 1 else np.array([1, 0, 0])
         t_mag = np.linalg.norm(tangent, axis=1, keepdims=True).clip(1e-10)
         e_t = tangent / t_mag
 
@@ -1488,6 +1582,303 @@ class CoilAnalysis:
         return 2.0 * ell * (np.log(2.0 * ell / s) + 0.5 + 0.2235 * s / ell)
 
     @staticmethod
+    def _fh_self_partial(W, L, T):
+        """Exact self-partial inductance of a rectangular bar.
+
+        # port of FastHenry joelself.c::self() (Hoer-Love 1965)
+
+        Returns ``self_raw`` — the value the C ``self(W,L,T)`` returns AFTER
+        ``z *= (2.0/PI); z *= L;`` but BEFORE the ``MU0`` factor that
+        ``mutual.c::selfterm`` applies separately (``joelself = MU0*self(...)``).
+        Units: metres (a length); EXCLUDES MU0.
+
+        Vectorized over NumPy arrays (W, L, T may be scalars or same-shape
+        arrays — one self-partial value per sub-filament segment). The term
+        grouping is preserved EXACTLY as in the C source: the asinh/atan/
+        algebraic terms are NOT algebraically simplified, because that
+        grouping guards against catastrophic cancellation in the cubic /
+        pancake / tall-stack regimes.
+
+        ``self(W,L,T)`` is symmetric under W <-> T swap; only the L slot
+        (the current-carrying length) is physically distinguished.
+        """
+        W = np.asarray(W, dtype=float)
+        L = np.asarray(L, dtype=float)
+        T = np.asarray(T, dtype=float)
+
+        w = W / L
+        t = T / L
+        r = np.sqrt(w * w + t * t)
+        aw = np.sqrt(w * w + 1.0)
+        at = np.sqrt(t * t + 1.0)
+        ar = np.sqrt(w * w + t * t + 1.0)
+
+        z = 0.25 * ((1 / w) * np.arcsinh(w / at)
+                    + (1 / t) * np.arcsinh(t / aw)
+                    + np.arcsinh(1 / r))
+        z = z + (1.0 / 24.0) * (
+            (t * t / w) * np.arcsinh(w / (t * at * (r + ar)))
+            + (w * w / t) * np.arcsinh(t / (w * aw * (r + ar)))
+            + ((t * t) / (w * w)) * np.arcsinh(w * w / (t * r * (at + ar)))
+            + ((w * w) / (t * t)) * np.arcsinh(t * t / (w * r * (aw + ar)))
+            + (1.0 / (w * t * t)) * np.arcsinh(w * t * t / (at * (aw + ar)))
+            + (1.0 / (t * w * w)) * np.arcsinh(t * w * w / (aw * (at + ar))))
+        z = z - (1.0 / 6.0) * (
+            (1.0 / (w * t)) * np.arctan(w * t / ar)
+            + (t / w) * np.arctan(w / (t * ar))
+            + (w / t) * np.arctan(t / (w * ar)))
+        z = z - (1.0 / 60.0) * (
+            ((ar + r + t + at) * t * t)
+            / ((ar + r) * (r + t) * (t + at) * (at + ar))
+            + ((ar + r + w + aw) * (w * w))
+            / ((ar + r) * (r + w) * (w + aw) * (aw + ar))
+            + (ar + aw + 1 + at)
+            / ((ar + aw) * (aw + 1) * (1 + at) * (at + ar)))
+        z = z - (1.0 / 20.0) * (
+            (1.0 / (r + ar)) + (1.0 / (aw + ar)) + (1.0 / (at + ar)))
+
+        z = z * (2.0 / np.pi)
+        z = z * L  # this is inductance (self_raw; EXCLUDES MU0)
+
+        return z
+
+    # FastHenry header constants (induct.h): EPS = 1e-13, MUOVER4PI = 1e-7.
+    _FH_EPS = 1.0e-13
+    # Length-relative near/far cutoff for the mutualfil() dispatcher. Pairs
+    # whose centre-to-centre distance exceeds _FH_FAR_FACTOR * max(seg len)
+    # use the cheap midpoint Neumann; nearer pairs use exact mutualfil().
+    _FH_FAR_FACTOR = 5.0
+    # sin²θ below which a pair is routed to the (numerically stable) parallel
+    # branch instead of the general formula (whose denom ~ 4l²m²·sin²θ).
+    _FH_PAR_EPS = 1.0e-8
+    # Target sub-filament count n_r·n_a for the auto cross-section grid. The
+    # split is chosen for square-ish cells (see _build_filament_grid). 36
+    # keeps the O(n_fil²) PEEC cost near the historical n_a≤2 path while
+    # resolving wide tapes enough for the GMD term to converge L to ~5%.
+    _FH_FIL_BUDGET = 36.0
+
+    @staticmethod
+    def _fh_mutualfil(p1a, p1b, p2a, p2b):
+        """Exact two-filament mutual inductance (Grover Ch.7).
+
+        # port of FastHenry mutual.c::mutualfil() (Grover Ch.7)
+
+        Vectorized over a grid of filament pairs. ``p1a, p1b`` are the
+        node-0 / node-1 endpoints of the first filament family (shape
+        ``(...,3)``); ``p2a, p2b`` the second. All four broadcast to a
+        common ``(...,3)`` shape; the function returns the per-pair mutual
+        in **μ₀/4π units** — i.e. the C value with the ``MUOVER4PI = 1e-7``
+        factor STRIPPED (the caller multiplies the summed result by
+        ``mu0_4pi = 1e-7`` to get Henries).
+
+        The term grouping of the C source is preserved verbatim. The four
+        C control-flow branches are realized as NumPy masks:
+          (i)   GENERAL arbitrary-filament formula (mutual.c ~484-537):
+                u,v,d, omega via atan2, tmp4 via atanh, M=cose*(2*tmp4-tmp5).
+          (ii)  PARALLEL-filament branch (mut_rect, ~329-414).
+          (iii) COLLINEAR branch (~396-408) inside the parallel block.
+          (iv)  touching-segment branch (~292-305) and the perpendicular
+                short-circuit (~316-317, returns 0).
+        Every division / atanh / sqrt is guarded against the d->0 and
+        parallel singularities exactly as the C does.
+        """
+        EPS = CoilAnalysis._FH_EPS
+
+        p1a = np.asarray(p1a, dtype=np.float64)
+        p1b = np.asarray(p1b, dtype=np.float64)
+        p2a = np.asarray(p2a, dtype=np.float64)
+        p2b = np.asarray(p2b, dtype=np.float64)
+
+        # Broadcast all endpoints to a common (...,3) shape.
+        bshape = np.broadcast_shapes(p1a.shape, p1b.shape, p2a.shape, p2b.shape)
+        p1a = np.broadcast_to(p1a, bshape)
+        p1b = np.broadcast_to(p1b, bshape)
+        p2a = np.broadcast_to(p2a, bshape)
+        p2b = np.broadcast_to(p2b, bshape)
+        gshape = bshape[:-1]                       # grid shape (n_f, n_g)
+
+        # Filament length vectors.
+        len1 = p1b - p1a                           # fil1: node0 -> node1
+        len2 = p2b - p2a                           # fil2: node0 -> node1
+        l = np.linalg.norm(len1, axis=-1)          # fil1->length
+        m = np.linalg.norm(len2, axis=-1)          # fil2->length
+        l_safe = np.maximum(l, 1e-300)
+        m_safe = np.maximum(m, 1e-300)
+
+        # Squared node-to-node distances (magdiff2): R1..R4.
+        def _sq(a, b):
+            d = a - b
+            return np.einsum('...k,...k->...', d, d)
+        R1sq = _sq(p1b, p2b)                        # magdiff2(fil1,1,fil2,1)
+        R2sq = _sq(p1b, p2a)                        # magdiff2(fil1,1,fil2,0)
+        R3sq = _sq(p1a, p2a)                        # magdiff2(fil1,0,fil2,0)
+        R4sq = _sq(p1a, p2b)                        # magdiff2(fil1,0,fil2,1)
+        R1 = np.sqrt(R1sq)
+        R2 = np.sqrt(R2sq)
+        R3 = np.sqrt(R3sq)
+        R4 = np.sqrt(R4sq)
+
+        maxR = np.maximum(np.maximum(R1, R2), np.maximum(R3, R4))
+        minR = np.minimum(np.minimum(R1, R2), np.minimum(R3, R4))
+        maxlength = np.maximum(l, m)
+
+        alpha = R4sq - R3sq + R2sq - R1sq
+
+        # dotprod(fil1, fil2)
+        dotp12 = np.einsum('...k,...k->...', len1, len2)
+
+        M = np.zeros(gshape, dtype=np.float64)
+        done = np.zeros(gshape, dtype=bool)        # pairs already assigned
+
+        # ---- (iv-a) touching segments: any Ri ~ 0 (mutual.c ~292-305) ----
+        touch = ((np.abs(R1) < EPS) | (np.abs(R2) < EPS)
+                 | (np.abs(R3) < EPS) | (np.abs(R4) < EPS))
+        if np.any(touch):
+            # R = R3 if R1~0; elif R4 if R2~0; elif R1 if R3~0; else R2
+            Rt = np.where(np.abs(R1) < EPS, R3,
+                  np.where(np.abs(R2) < EPS, R4,
+                   np.where(np.abs(R3) < EPS, R1, R2)))
+            lm = np.maximum(l * m, 1e-300)
+            a1 = m / np.maximum(l + Rt, 1e-300)
+            a2 = l / np.maximum(m + Rt, 1e-300)
+            a1 = np.clip(a1, -1.0 + 1e-15, 1.0 - 1e-15)
+            a2 = np.clip(a2, -1.0 + 1e-15, 1.0 - 1e-15)
+            Mt = 2.0 * (dotp12 / lm) * (l * np.arctanh(a1) + m * np.arctanh(a2))
+            sel = touch & ~done
+            M = np.where(sel, Mt, M)
+            done = done | touch
+
+        # ---- cosine & perpendicular short-circuit (mutual.c ~307-327) ----
+        realcos = dotp12 / (l_safe * m_safe)
+        cose = realcos
+        # perpendicular: |realcos| < EPS -> M = 0 (already zero in M)
+        perp = (np.abs(realcos) < EPS) & ~done
+        done = done | perp
+
+        # ---- (ii)+(iii) parallel filaments (mutual.c ~329-414) ----
+        # The C uses |abs(cose) - 1| < EPS, relying on its mutual()
+        # dispatcher to pre-route parallel pairs here. We feed ALL near
+        # pairs to mutualfil(), so near-parallel segments (e.g. concentric
+        # coplanar sub-filament loops) must also take the stable parallel
+        # branch: the GENERAL formula's denominator is 4l²m²·sin²θ and its
+        # tmp5 divides by sinθ, both -> 0 as θ -> 0, overflowing u,v. Route
+        # to the parallel branch whenever sin²θ = 1 - cos²θ is below
+        # _FH_PAR_EPS (general branch then stays well-conditioned).
+        sinsq_all = np.clip(1.0 - cose * cose, 0.0, None)
+        parallel = (sinsq_all < CoilAnalysis._FH_PAR_EPS) & ~done
+        if np.any(parallel):
+            # unit vector along fil1
+            magu = np.maximum(l, 1e-300)
+            u_hat = len1 / magu[..., None]
+            # R vector from fil1.node0 to fil2.node0
+            Rvec = p2a - p1a
+            dotp = np.einsum('...k,...k->...', u_hat, Rvec)
+            dvec = Rvec - dotp[..., None] * u_hat
+            d = np.linalg.norm(dvec, axis=-1)
+
+            x1_0 = np.zeros(gshape)
+            x1_1 = l
+            # x2_0 = (fil2.node0 - (fil1.node0 + dvec)) . u_hat
+            v0 = p2a - (p1a + dvec)
+            x2_0 = np.einsum('...k,...k->...', v0, u_hat)
+            v1 = p2b - (p1a + dvec)
+            x2_1 = np.einsum('...k,...k->...', v1, u_hat)
+
+            # collinear: |d| < EPS  (mutual.c ~396-408)
+            collinear = parallel & (np.abs(d) < EPS)
+            # generic-parallel: parallel & not collinear
+            par_gen = parallel & ~collinear
+
+            # mut_rect(len, d) = sqrt(len^2 + d^2) - len*asinh(len/d)
+            def _mut_rect(length, dd):
+                dd_safe = np.maximum(dd, 1e-300)
+                return np.sqrt(length * length + dd * dd) - length * np.arcsinh(length / dd_safe)
+
+            if np.any(par_gen):
+                Mp = (_mut_rect(x2_1 - x1_1, d) - _mut_rect(x2_1 - x1_0, d)
+                      - _mut_rect(x2_0 - x1_1, d) + _mut_rect(x2_0 - x1_0, d))
+                M = np.where(par_gen, Mp, M)
+
+            if np.any(collinear):
+                # x*log|x| terms; lim x->0 of x log|x| = 0.
+                def _xlogx(x):
+                    ax = np.abs(x)
+                    safe = np.where(ax < 1e-300, 1.0, ax)
+                    return np.where(ax < 1e-300, 0.0, ax * np.log(safe))
+                Mc = (_xlogx(x2_1 - x1_0) - _xlogx(x2_1 - x1_1)
+                      - _xlogx(x2_0 - x1_0) + _xlogx(x2_0 - x1_1))
+                M = np.where(collinear, Mc, M)
+
+            done = done | parallel
+
+        # ---- (i) GENERAL arbitrary filament formula (mutual.c ~484-537) ----
+        gen = ~done
+        if np.any(gen):
+            l2 = l * l
+            m2 = m * m
+            alpha2 = alpha * alpha
+            denom = 4.0 * l2 * m2 - alpha2
+            # denom = 4l²m²·sin²θ -> 0 for parallel pairs. Those are routed to
+            # the parallel branch (and their gen result discarded), but clamp
+            # the magnitude here so the discarded entries can't overflow u,v
+            # (which would otherwise spew RuntimeWarnings and risk NaN leakage).
+            denom_floor = np.maximum(4.0 * l2 * m2 * CoilAnalysis._FH_PAR_EPS, 1e-300)
+            denom_safe = np.where(np.abs(denom) < denom_floor,
+                                  np.sign(denom + (denom == 0)) * denom_floor,
+                                  denom)
+
+            u = l * (2 * m2 * (R2sq - R3sq - l2) + alpha * (R4sq - R3sq - m2)) / denom_safe
+            v = m * (2 * l2 * (R4sq - R3sq - m2) + alpha * (R2sq - R3sq - l2)) / denom_safe
+            u2 = u * u
+            v2 = v * v
+
+            dd = (R3sq - u2 - v2 + 2.0 * u * v * cose)
+            # zero-out tiny d (mutual.c ~499-508)
+            scale = (np.abs(dd) / (R3sq + u2 + v2 + 1.0)
+                     * (maxlength * maxlength / np.maximum(maxR * maxR, 1e-300)))
+            dd = np.where(scale < EPS, 0.0, dd)
+            dd = np.where(dd < 0.0, 0.0, dd)        # Enrico/Matt patch
+            d = np.sqrt(dd)
+
+            sinsq = 1.0 - cose * cose
+            sinsq = np.where(np.abs(sinsq) < EPS, 0.0, sinsq)
+            sine = np.sqrt(sinsq)
+            tmp1 = d * d * cose
+            tmp2 = d * sine
+            tmp3 = sine * sine
+
+            # omega via atan2; 0 when d ~ 0.
+            tmp2_safe = np.where(np.abs(tmp2) < 1e-300, 1e-300, tmp2)
+            R1s = np.maximum(R1, 1e-300)
+            R2s = np.maximum(R2, 1e-300)
+            R3s = np.maximum(R3, 1e-300)
+            R4s = np.maximum(R4, 1e-300)
+            omega = (np.arctan2(tmp1 + (u + l) * (v + m) * tmp3, tmp2_safe * R1s)
+                     - np.arctan2(tmp1 + (u + l) * v * tmp3, tmp2_safe * R2s)
+                     + np.arctan2(tmp1 + u * v * tmp3, tmp2_safe * R3s)
+                     - np.arctan2(tmp1 + u * (v + m) * tmp3, tmp2_safe * R4s))
+            omega = np.where(np.abs(d) < EPS, 0.0, omega)
+
+            def _atanh_safe(x):
+                return np.arctanh(np.clip(x, -1.0 + 1e-15, 1.0 - 1e-15))
+
+            tmp4 = ((u + l) * _atanh_safe(m / np.maximum(R1 + R2, 1e-300))
+                    + (v + m) * _atanh_safe(l / np.maximum(R1 + R4, 1e-300))
+                    - u * _atanh_safe(m / np.maximum(R3 + R4, 1e-300))
+                    - v * _atanh_safe(l / np.maximum(R2 + R3, 1e-300)))
+
+            sine_safe = np.where(np.abs(sine) < 1e-150, 1.0, sine)
+            tmp5 = np.where(np.abs(sine) < 1e-150, 0.0, omega * d / sine_safe)
+
+            Mg = cose * (2.0 * tmp4 - tmp5)
+            M = np.where(gen, Mg, M)
+
+        # NaN/inf guard (the C prints a warning and returns the raw value;
+        # here clamp to 0 so a single degenerate pair can't poison the sum).
+        M = np.where(np.isfinite(M), M, 0.0)
+        return M
+
+    @staticmethod
     def _pair_integral(dl_f: np.ndarray, mid_f: np.ndarray,
                         dl_g: np.ndarray, mid_g: np.ndarray,
                         self_pair: bool,
@@ -1495,36 +1886,34 @@ class CoilAnalysis:
                         same_coil: bool = True) -> float:
         """Hybrid PEEC partial mutual-inductance integral in µ₀/4π units.
 
-        Uses midpoint Neumann ``dl_i · dl_j / r_ij`` as the default kernel
-        — accurate for widely separated pairs AND for end-to-end adjacent
-        segments on curved filaments (where parallel-coincident assumptions
-        fail). Replaces specific singular / near-singular cases with
-        closed-form analytical expressions:
+        Dispatches like FastHenry ``mutual.c::mutual()``:
+
+          - **Well-separated segment pairs** (centre-to-centre distance
+            ``d`` greater than ``_FH_FAR_FACTOR × max(seg length)``): the
+            cheap midpoint Neumann ``dl_i · dl_j / r_ij`` is already
+            accurate, so it is kept. This dominates the pair count and
+            keeps the cost near the original vectorized path.
+
+          - **Near / parallel / collinear / touching pairs**: replaced by
+            a verbatim vectorized port of ``mutual.c::mutualfil()`` (Grover
+            Ch.7 two-filament mutual), which handles the parallel, collinear
+            and touching singularities in closed form. Each segment is a
+            rectangular bar; ``mutualfil`` takes the centreline endpoints
+            (here ``mid ± dl/2``). This replaces the previous midpoint
+            ``dot/d`` + ad-hoc ``M_par`` coincident-parallel closed form on
+            the near pairs — the off-diagonal source of the thin-loop bias.
 
           - **i = j on same filament (`self_pair=True`)**: divergent;
-            replaced with Grover's partial self-inductance of a straight
-            rectangular bar with cross-section ``(w_self, t_self)``.
+            replaced with the exact rectangular-bar self-partial
+            (``_fh_self_partial``, FastHenry ``joelself.c::self``) at the
+            sub-cell cross-section ``(w_self, t_self)``. The i=j diagonal is
+            dropped from the pair matrix first so there is NO double-count
+            between the off-diagonal ``mutualfil`` kernel and the self
+            diagonal.
 
-          - **i = j on DIFFERENT filaments of the SAME coil**
-            (``self_pair=False``, ``same_coil=True``): these are spatially
-            coincident-longitudinal pairs separated only by the small
-            inter-filament distance across the pack. Midpoint Neumann
-            gives ``dl²/d`` here, which overcounts when ``d ≪ L``.
-            Replaced by the Hoer-Love / Ruehli closed-form for parallel
-            coincident filaments:
-
-                M_par(L, d) = 2·[L·arcsinh(L/d) + d − √(L² + d²)]
-
-            exactly reducing to ``L²/d`` for ``d ≫ L`` and staying finite
-            for ``d ≪ L``.
-
-          - **i = j between DIFFERENT coils** (``same_coil=False``): same
-            segment index carries no "close-pair" meaning — coils are at
-            arbitrary positions in space. Midpoint Neumann is retained.
-
-        This hybrid eliminates the distributed-filament overcounting on
-        the pack cross-section while preserving midpoint Neumann accuracy
-        for genuine inter-coil mutuals.
+          - **between DIFFERENT coils** (``same_coil=False``): the same
+            near/far dispatch applies; matching segment indices carry no
+            special meaning.
         """
         ell_f = np.linalg.norm(dl_f, axis=1)                  # (n_f,)
         ell_g = np.linalg.norm(dl_g, axis=1)                  # (n_g,)
@@ -1533,49 +1922,70 @@ class CoilAnalysis:
         d_arr = np.linalg.norm(diff, axis=2)                   # (n_f, n_g)
         dot   = np.einsum('ik,jk->ij', dl_f, dl_g)             # (n_f, n_g)
 
-        # Standard midpoint Neumann everywhere.
+        if self_pair:
+            # WITHIN-FILAMENT (i,j on the SAME sub-filament). The sub-filament
+            # is a finite-cross-section conductor (rectangular bar w_self ×
+            # t_self) modelled along its centreline. The segment-to-segment
+            # mutual of such a conductor cannot use the zero-width centreline
+            # Neumann ``dl·dl/d`` directly: as the curve is refined the
+            # adjacent-segment term ``ell²/d`` diverges logarithmically, with
+            # no cross-section to regularise it (it converges to the THIN-WIRE
+            # loop self-L, not the finite-cross-section one — verified ~1.9×
+            # too high for the TEAM-22 0.8 m-wide sub-cell). The textbook
+            # Grover/Rosa regularisation replaces the line-to-line distance by
+            # the geometric-mean distance of the cross-section:
+            #     d_eff = sqrt(d² + GMD²),   GMD = 0.2235·(w_self + t_self).
+            # This is a single general rule applied uniformly to every
+            # within-filament pair (no shape detection), and reproduces the
+            # GMD-regularised loop self-L to ~3% on the TEAM-22 stack while
+            # leaving thin sub-cells (GMD→0) untouched.
+            gmd = 0.2235 * (float(w_self) + float(t_self))
+            d_reg = np.sqrt(d_arr * d_arr + gmd * gmd)
+            d_reg = np.maximum(d_reg, 1e-12)
+            M_matrix = dot / d_reg
+            # Drop the (i=j) diagonal (self-term) and replace with the exact
+            # rectangular-bar self-partial below.
+            np.fill_diagonal(M_matrix, 0.0)
+            ell_safe = np.maximum(ell_f, 1e-12)
+            # Exact rectangular-bar self-partial (FastHenry joelself.c::self,
+            # mutual.c::selfterm). _fh_self_partial returns self_raw (EXCLUDES
+            # MU0); the rest of _pair_integral works in µ₀/4π units (caller
+            # multiplies the sum by mu0_4pi=1e-7=MU0/4π to get Henries). Since
+            # selfterm = MU0*self_raw, the µ₀/4π-unit diagonal term is
+            # 4π*self_raw (= MU0/1e-7 * self_raw). self() is symmetric under
+            # W<->T, so only the L slot matters: ell_safe (the per-segment
+            # current-carrying length) MUST go in the L slot; w_self/t_self
+            # order is irrelevant.
+            grover_diag = 4.0 * np.pi * CoilAnalysis._fh_self_partial(
+                w_self, ell_safe, t_self)
+            return float(np.sum(M_matrix)) + float(np.sum(grover_diag))
+
+        # CROSS-FILAMENT (f != g): two genuinely distinct conductors. Far
+        # pairs: cheap midpoint Neumann. Near / parallel / collinear /
+        # touching pairs: exact mutualfil() (Grover Ch.7), which matches the
+        # analytic Maxwell coaxial mutual to ~1e-4 and resolves the near-field
+        # singularities the midpoint Neumann mishandles. This mirrors
+        # FastHenry's mutual() dispatcher (exact integrals only when the
+        # filaments are close relative to their size; mutualfil far away).
         d_safe = np.maximum(d_arr, 1e-12)
         M_matrix = dot / d_safe
-
-        # Replace the i=j diagonal ONLY when the two filaments are on the
-        # same coil (so matching indices means geometrically coincident
-        # longitudinal span across the pack cross-section). For different
-        # coils, matching indices have no geometric significance and
-        # midpoint Neumann is the correct kernel. Fully vectorized — the
-        # previous per-index Python loop was the dominant cost (300 × 144
-        # scalar numpy calls per coil pair, ~86k iterations for a 2-coil
-        # circuit, visibly laggy on macOS).
-        n_diag = min(len(ell_f), len(ell_g))
-        if not self_pair and same_coil and n_diag > 0:
-            diag_d = np.maximum(np.diagonal(d_arr)[:n_diag], 1e-12)      # (n_diag,)
-            diag_dot = np.diagonal(dot)[:n_diag]                         # (n_diag,)
-            L_diag = 0.5 * (ell_f[:n_diag] + ell_g[:n_diag])              # (n_diag,)
-            L_safe = np.maximum(L_diag, 1e-12)
-            ell_prod = np.maximum(ell_f[:n_diag] * ell_g[:n_diag], 1e-30)
-            cos_th = diag_dot / ell_prod
-            M_par = 2.0 * (L_safe * np.arcsinh(L_safe / diag_d)
-                           + diag_d - np.sqrt(L_safe**2 + diag_d**2))
-            M_diag = cos_th * M_par
-            # Write back onto the i=j diagonal
-            idx = np.arange(n_diag)
-            M_matrix[idx, idx] = M_diag
-
-        if self_pair:
-            # Drop the (i=j) diagonal (divergent) and replace with Grover
-            # straight-bar self-partial at the filament's cross-section.
-            np.fill_diagonal(M_matrix, 0.0)
-            s = max(float(w_self) + float(t_self), 1e-12)
-            ell_safe = np.maximum(ell_f, 1e-12)
-            grover_diag = 2.0 * ell_safe * (
-                np.log(np.maximum(2.0 * ell_safe / s, 1e-12))
-                + 0.5 + 0.2235 * s / ell_safe
-            )
-            return float(np.sum(M_matrix)) + float(np.sum(grover_diag))
+        seg_scale = np.maximum(ell_f[:, None], ell_g[None, :])        # (n_f,n_g)
+        near = d_arr <= (CoilAnalysis._FH_FAR_FACTOR * seg_scale)
+        if np.any(near):
+            # Centreline endpoints: node0 = mid - dl/2, node1 = mid + dl/2.
+            p1a_full = mid_f - 0.5 * dl_f                              # (n_f,3)
+            p1b_full = mid_f + 0.5 * dl_f
+            p2a_full = mid_g - 0.5 * dl_g                              # (n_g,3)
+            p2b_full = mid_g + 0.5 * dl_g
+            fi, gj = np.where(near)
+            M_near = CoilAnalysis._fh_mutualfil(
+                p1a_full[fi], p1b_full[fi], p2a_full[gj], p2b_full[gj])
+            M_matrix[fi, gj] = M_near
         return float(np.sum(M_matrix))
 
     def _compute_self_inductance(self):
         """
-        Self-inductance via a proper PEEC formulation:
+        Self-inductance via distributed-filament PEEC:
 
             L = (µ₀ N² / 4π) · Σ_f Σ_g  α_f · α_g · pair_integral(f, g)
 
@@ -1583,18 +1993,16 @@ class CoilAnalysis:
         ``n_r × n_a`` Gauss-Legendre sub-filaments (``α_f`` are the area
         fractions, Σα = 1). Every filament pair integral uses the
         Hoer-Love / Ruehli parallel-filament closed form on all segment
-        pairs — see ``_pair_integral`` docstring. The f==g diagonal
-        replaces the divergent i=j self-segment term with Grover's bar
-        self-partial at the **sub-cell** cross-section (``t/n_r × w/n_a``);
-        the singular behaviour at close filament-to-filament approaches
-        is handled exactly by the closed-form pair kernel rather than by
-        midpoint Neumann, which was the over-counting mode of the earlier
-        distributed attempt.
+        pairs — see ``_pair_integral`` docstring. The f==g diagonal uses
+        the straight-bar self-partial with the sub-cell cross-section
+        ``(t/n_r × w/n_a)``.
 
-        For ``n_fil == 1`` (thin pack), the single "filament" uses the
-        full pack cross-section for Grover's regularisation — this
-        recovers the centerline-based formulation that matches Grover's
-        closed-form circular-coil expression ``L = µ₀·R·N²·[ln(8R/GMD) − 2]``.
+        Known limitation (TEAM-22 class): when the sub-cell cross-section
+        is comparable to or larger than the per-segment length (e.g.
+        d=27cm pack with 360 segments around a 2m loop → 35mm segments
+        vs 800mm sub-cell width), the straight-bar self-partial formula
+        is outside its valid regime and over-counts. Real fix is a
+        kernel change, not a discretisation knob — see open thread.
 
         Validation targets:
           - Circular loop (R=300mm, N=1, thin tape): 2.22 µH analytical.

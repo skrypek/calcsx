@@ -54,6 +54,7 @@ class MultiCoilEnvironment:
         thickness: float = 80.0,
         width: float = 4.0,
         tape_normals: np.ndarray = None,
+        winding_growth: str = 'symmetric',
     ) -> None:
         """Add or replace a coil.  Marks all OTHER coils stale."""
         self._coil_params[coil_id] = dict(
@@ -63,6 +64,7 @@ class MultiCoilEnvironment:
             thickness=thickness,
             width=width,
             tape_normals=tape_normals,
+            winding_growth=winding_growth,
         )
         self._rebuild_engine(coil_id)
         self._L_cache = None   # geometry changed — invalidate L-matrix cache
@@ -100,7 +102,8 @@ class MultiCoilEnvironment:
             return
         old = self._coil_params[coil_id]
         geometry_changed = False
-        for key in ('winds', 'thickness', 'width', 'tape_normals'):
+        for key in ('winds', 'thickness', 'width', 'tape_normals',
+                    'winding_growth'):
             if key in kwargs and kwargs[key] != old.get(key):
                 geometry_changed = True
                 break
@@ -285,20 +288,34 @@ class MultiCoilEnvironment:
                             )
                             acc += w_f * w_g * pair
                 else:
-                    # Cross-coil mutual (L_ij, i≠j): use single centerlines
-                    # on both sides. Pack cross-section effects on mutual
-                    # are O((pack_size / separation)²) — negligible for
-                    # coils that aren't actually bifilar-wound on the same
-                    # centerline. Midpoint Neumann between the centerlines
-                    # matches the elliptic-integral analytical for coaxial
-                    # circular coils to <0.5 %.
-                    acc = CoilAnalysis._pair_integral(
-                        eng_i._dl, eng_i.midpoints,
-                        eng_j._dl, eng_j.midpoints,
-                        self_pair=False,
-                        w_self=0.0, t_self=0.0,
-                        same_coil=False,
-                    )
+                    # Cross-coil mutual (L_ij, i≠j): double-sum over BOTH
+                    # coils' distributed filament grids. The earlier
+                    # centerline-only path was only valid when
+                    # pack_size / separation << 1; for TEAM-22-style nested
+                    # SMES coils the pack dimensions (~ m) are comparable to
+                    # the centerline-to-centerline gap (~ m), so the
+                    # centerline approximation under-estimates M and
+                    # consequently over-estimates total energy (the negative
+                    # cross-term M·I_i·I_j ends up too small in magnitude).
+                    # Cost: O(n_fil_i · n_fil_j · axis_num²) per pair —
+                    # symmetric with the self-inductance pair sum above.
+                    fil_dl_i, fil_mid_i, wts_i, _, _ = \
+                        _distributed_filaments(eng_i)
+                    fil_dl_j, fil_mid_j, wts_j, _, _ = \
+                        _distributed_filaments(eng_j)
+                    acc = 0.0
+                    for f in range(len(wts_i)):
+                        w_f = float(wts_i[f])
+                        for g in range(len(wts_j)):
+                            w_g = float(wts_j[g])
+                            pair = CoilAnalysis._pair_integral(
+                                fil_dl_i[f], fil_mid_i[f],
+                                fil_dl_j[g], fil_mid_j[g],
+                                self_pair=False,
+                                w_self=0.0, t_self=0.0,
+                                same_coil=False,
+                            )
+                            acc += w_f * w_g * pair
 
                 Mij = mu0_4pi * Ni * Nj * acc
                 L[i, j] = Mij
@@ -337,6 +354,7 @@ class MultiCoilEnvironment:
             p['coords'], p['winds'], p['current'],
             p['thickness'], p['width'],
             tape_normals=p.get('tape_normals'),
+            winding_growth=p.get('winding_growth', 'symmetric'),
         )
         eng._compute_pca()
         eng._compute_arc()
